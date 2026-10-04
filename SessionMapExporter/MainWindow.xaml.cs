@@ -40,7 +40,7 @@ public partial class MainWindow : Window
         {
             ExportButton.IsEnabled = false;
             _maps.Clear();
-            StatusText.Text = "Mounting archives and enumerating worlds…";
+            StatusText.Text = "Mounting archives…";
 
             var root = GameFolderBox.Text.Trim();
             var key = AesKeyBox.Password.Trim();
@@ -51,11 +51,11 @@ public partial class MainWindow : Window
 
             await Task.Run(() => _service.Initialize(pakDir, key));
 
-            var found = await Task.Run(() => _service.FindWorlds());
+            var found = await Task.Run(() => _service.FindWorlds(new Progress<string>(s => Dispatcher.Invoke(() => StatusText.Text = s))));
             foreach (var map in found)
                 _maps.Add(map);
 
-            MapCountText.Text = $"{_maps.Count} worlds found";
+            MapCountText.Text = $"{_maps.Count} actual worlds found";
             StatusText.Text = _maps.Count == 0
                 ? "No .umap worlds were found."
                 : "Ready — select one, several, or all worlds.";
