@@ -1,0 +1,63 @@
+name: Build Windows
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET 10
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Show toolchain
+        shell: pwsh
+        run: |
+          dotnet --info
+          dotnet --list-sdks
+
+      - name: Restore
+        run: dotnet restore SessionMapExporter.sln
+
+      - name: Build
+        run: dotnet build SessionMapExporter.sln -c Release --no-restore --nologo
+
+      - name: Publish self-contained Windows x64
+        run: >
+          dotnet publish SessionMapExporter/SessionMapExporter.csproj
+          -c Release
+          -r win-x64
+          --self-contained true
+          -p:PublishSingleFile=true
+          -p:IncludeNativeLibrariesForSelfExtract=true
+          -p:EnableCompressionInSingleFile=true
+          -p:DebugType=None
+          -p:DebugSymbols=false
+          -o artifacts/publish
+
+      - name: Package
+        shell: pwsh
+        run: |
+          Compress-Archive -Path artifacts/publish/* -DestinationPath artifacts/SessionMapExporter-win-x64.zip
+          Get-ChildItem artifacts/publish | Format-Table Name,Length
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: SessionMapExporter-win-x64
+          path: artifacts/SessionMapExporter-win-x64.zip
+          if-no-files-found: error
