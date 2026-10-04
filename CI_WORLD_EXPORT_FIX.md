@@ -1,0 +1,1 @@
+Temporary CI verification branch: validates the world discovery/USD export fix on Windows CI. This file can be removed after verification.
