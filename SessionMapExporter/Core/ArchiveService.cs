@@ -58,7 +58,7 @@ public sealed class ArchiveService
         if (Provider is null) throw new InvalidOperationException("Provider has not been initialized.");
 
         var candidates = Provider.Files.Values
-            .Select(x => x.Path.Replace('\', '/'))
+            .Select(x => x.Path.Replace('\\', '/'))
             .Where(p => p.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
             .Distinct(StringComparer.OrdinalIgnoreCase)
             .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
