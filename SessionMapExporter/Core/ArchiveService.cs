@@ -10,6 +10,9 @@ using CUE4Parse_Conversion.Options;
 
 namespace SessionMapExporter.Core;
 
+/// <summary>One export job: a world plus the folder it should end up in.</summary>
+public sealed record ExportRequest(MapEntry World, string FolderName, string DisplayName);
+
 public sealed class ArchiveService
 {
     public DefaultFileProvider? Provider { get; private set; }
@@ -92,13 +95,12 @@ public sealed class ArchiveService
         }
 
         return worlds
-            .OrderBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
-            .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
     public async Task ExportWorldsAsync(
-        IReadOnlyList<MapEntry> maps,
+        IReadOnlyList<ExportRequest> requests,
         string outputRoot,
         bool exportTextures,
         bool exportMaterials,
@@ -112,27 +114,30 @@ public sealed class ArchiveService
         var mapsRoot = Path.Combine(outputRoot, "Maps");
         Directory.CreateDirectory(mapsRoot);
 
-        foreach (var map in maps)
+        // one builder script + short readme per export run, next to Maps/
+        WriteBuilderScript(outputRoot);
+        WriteReadme(outputRoot);
+
+        var usedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
+
+        foreach (var request in requests)
         {
             ct.ThrowIfCancellationRequested();
 
-            // Preserve the package hierarchy so identically named worlds cannot overwrite
-            // one another. The WorldExporter itself consolidates streaming levels into
-            // the selected persistent world via USD subLayers.
-            var relative = map.Path.Replace('/', Path.DirectorySeparatorChar);
-            relative = Path.ChangeExtension(relative, null) ?? relative;
-            var mapOut = Path.Combine(mapsRoot, SanitizeRelativePath(relative));
-            Directory.CreateDirectory(mapOut);
+            // Clean layout: Maps/<Map Name>/source  - no more deep package trees.
+            var mapOut = Path.Combine(mapsRoot, UniqueFolderName(request.FolderName, usedFolders));
+            var sourceOut = Path.Combine(mapOut, "source");
+            Directory.CreateDirectory(sourceOut);
 
-            progress?.Report($"Loading world {map.DisplayName}…");
+            progress?.Report($"Loading world {request.World.DisplayName}…");
 
-            var package = Provider.LoadPackage(map.Path);
+            var package = Provider.LoadPackage(request.World.Path);
             var world = package.GetExports()
                 .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
 
             if (world is null)
             {
-                summary.Add(new { map.Path, success = false, error = "UWorld export could not be resolved." });
+                summary.Add(new { world = request.World.Path, success = false, error = "UWorld export could not be resolved." });
                 continue;
             }
 
@@ -144,24 +149,33 @@ public sealed class ArchiveService
             session.Add(world);
             var options = BuildExportOptions(exportTextures, exportMaterials);
 
-            progress?.Report($"Exporting {map.DisplayName} as USD…");
-            var results = await session.RunAsync(mapOut, options, null, ct);
+            progress?.Report($"Exporting {request.DisplayName} as USD…");
+            var results = await session.RunAsync(sourceOut, options, null, ct);
 
             if (noGameLighting)
-                StripUsdLights(mapOut);
+                StripUsdLights(sourceOut);
+
+            var sourceWorlds = results
+                .Where(r => r.Success && r.DiskFilePaths is not null)
+                .SelectMany(r => r.DiskFilePaths!)
+                .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
+                .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
+                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .ToList();
 
             var manifest = new
             {
-                map.Path,
-                map.DisplayName,
-                exportedAtUtc = DateTime.UtcNow,
+                map = request.World.Path,
+                displayName = request.DisplayName,
                 format = "USD / USDA",
+                builder = "run  python build_map.py  (see README.txt)  to produce the .glb",
+                exportedAtUtc = DateTime.UtcNow,
                 persistentWorldOnly = true,
                 streamingLevelsConsolidatedByWorldExporter = true,
                 gameLightingExcluded = noGameLighting,
-                gameLightmapDataImported = false,
                 textureExportRequested = exportTextures,
                 materialExportRequested = exportMaterials,
+                sourceWorlds,
                 resultCount = results.Count,
                 successfulResultCount = results.Count(r => r.Success),
                 results = results.Select(r => new
@@ -178,12 +192,10 @@ public sealed class ArchiveService
                 JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }),
                 ct);
 
-            WriteBlenderHelper(mapOut);
-
             summary.Add(new
             {
-                map.Path,
-                map.DisplayName,
+                world = request.World.Path,
+                displayName = request.DisplayName,
                 success = results.Any(r => r.Success),
                 resultCount = results.Count,
                 outputDirectory = mapOut
@@ -191,14 +203,27 @@ public sealed class ArchiveService
         }
 
         await File.WriteAllTextAsync(
-            Path.Combine(mapsRoot, "maps-export-summary.json"),
+            Path.Combine(outputRoot, "maps-export-summary.json"),
             JsonSerializer.Serialize(new
             {
                 exportedAtUtc = DateTime.UtcNow,
-                mapCount = maps.Count,
+                mapCount = requests.Count,
                 maps = summary
             }, new JsonSerializerOptions { WriteIndented = true }),
             ct);
+    }
+
+    private static string UniqueFolderName(string folderName, HashSet<string> used)
+    {
+        // folder names may contain subfolders (individual-world exports)
+        var segments = folderName.Split('\\', '/');
+        var name = string.Join(Path.DirectorySeparatorChar,
+            segments.Select(MapGrouping.Sanitize));
+        var candidate = name;
+        var i = 2;
+        while (!used.Add(candidate))
+            candidate = $"{name} {i++}";
+        return candidate;
     }
 
     private static ExportOptions BuildExportOptions(bool textures, bool materials)
@@ -225,7 +250,11 @@ public sealed class ArchiveService
         SetEnumProperty(instance, "MaterialExportFormat", materials ? "AllLayersNoRef" : "TopLayerOnly");
         SetBoolProperty(instance, "SaveEmbeddedMaterials", materials);
         SetBoolProperty(instance, "ExportMaterials", materials);
-        SetBoolProperty(instance, "ExportAllTextureMips", true);
+        // NOTE: must stay false. USD material files reference "<Texture>.png" without a
+        // mip suffix; with all-mips enabled the exporter writes T_Name_MIP0.png etc. and
+        // every material silently lost its textures. (build_map.py tolerates old
+        // _MIP* folders, but fresh exports no longer produce them.)
+        SetBoolProperty(instance, "ExportAllTextureMips", false);
         SetBoolProperty(instance, "SaveHdrTexturesAsHdr", false);
         return instance;
     }
@@ -281,19 +310,6 @@ public sealed class ArchiveService
         var p = obj.GetType().GetProperty(property);
         if (p?.CanWrite == true && p.PropertyType == typeof(bool))
             p.SetValue(obj, value);
-    }
-
-    private static string SanitizeRelativePath(string value)
-    {
-        var parts = value.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
-        return Path.Combine(parts.Select(Sanitize).ToArray());
-    }
-
-    private static string Sanitize(string value)
-    {
-        foreach (var c in Path.GetInvalidFileNameChars())
-            value = value.Replace(c, '_');
-        return string.IsNullOrWhiteSpace(value) ? "Map" : value;
     }
 
     private static void StripUsdLights(string root)
@@ -364,31 +380,47 @@ public sealed class ArchiveService
         return count;
     }
 
-    private static void WriteBlenderHelper(string mapOut)
+    /// <summary>
+    /// Writes the single build_map.py helper (and a short README) into the export
+    /// root. The script converts each exported map into one clean .glb with
+    /// embedded textures; it only needs regular Python - no Blender install.
+    /// </summary>
+    private static void WriteBuilderScript(string outputRoot)
     {
-        var script = """
-import bpy
-from pathlib import Path
+        File.WriteAllText(Path.Combine(outputRoot, "build_map.py"), BuildMapScript.Content);
+    }
 
-ROOT = Path(__file__).resolve().parent
+    private static void WriteReadme(string outputRoot)
+    {
+        var readme = """
+            HOW TO GET THIS MAP INTO BLENDER
+            ================================
 
-# The exporter emits a USD world plus referenced mesh/material/texture assets.
-# Import the world stages first so streaming sublayers resolve as one scene.
-worlds = sorted(ROOT.rglob("*.usda"))
-for path in worlds:
-    try:
-        bpy.ops.wm.usd_import(filepath=str(path))
-    except Exception as exc:
-        print("SessionMapExporter: USD import failed:", path, exc)
+            1. Install Python 3.8+ from python.org (or use the one you have).
 
-# The USD world has already had Unreal light prims removed when the option is enabled.
-# Remove any imported light objects defensively as well.
-for obj in list(bpy.data.objects):
-    if obj.type == 'LIGHT':
-        bpy.data.objects.remove(obj, do_unlink=True)
+            2. Open a terminal in THIS folder and run:
 
-print("SessionMapExporter: world import pass complete.")
-""";
-        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), script);
+                   python build_map.py
+
+               That converts every map below Maps/ into a single .glb file with
+               all textures embedded. To build just one map:
+
+                   python build_map.py "Maps/<map name>"
+
+            3. In Blender:  File -> Import -> glTF 2.0  and pick
+               Maps/<map name>/<map name>.glb
+
+            Optional (better materials, smaller textures):
+                pip install pillow
+                python build_map.py --max-texture-size 2048
+
+            Folder layout
+            -------------
+              Maps/<Map Name>/source/          raw USD export (keep, it is the master copy)
+              Maps/<Map Name>/<Map Name>.glb   the model you import into Blender
+              Maps/<Map Name>/build-report.json what was built / skipped / missing
+              build_map.py                     the converter (safe to copy elsewhere)
+            """;
+        File.WriteAllText(Path.Combine(outputRoot, "README.txt"), readme);
     }
 }

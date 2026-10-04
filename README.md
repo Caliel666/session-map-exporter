@@ -8,11 +8,12 @@ Windows/WPF exporter for Session Skate Sim worlds.
 * Enter the AES key at runtime (nothing is hard-coded).
 * Mount the game's PAK/IoStore archives with CUE4Parse.
 * Enumerate **every virtual `.umap`** found in all mounted archives. There is no hardcoded map list.
-* Search/filter the complete world list.
-* Export one, several, or all worlds.
+* **Consolidates the world list into real maps.** Session ships dozens of auxiliary worlds per map (`…_Art`, `_Audio`, `_Lights`, `_Vege`, `_Unmerged`, …); the map selector shows one entry per map (e.g. *LESColemen Park*) with a chosen primary world, not 700+ raw packages. Tick **Show individual worlds** to see the raw list again.
+* Search/filter the map list.
+* Export one, several, or all maps.
 * Uses CUE4Parse-Conversion's `ExportSession`, which has native handlers for UWorld, static meshes, textures, materials, landscapes and spline meshes.
-* Requests glTF-oriented mesh output and PNG textures where the current CUE4Parse version exposes those formats.
-* Writes `export-manifest.json` and a `import_to_blender.py` helper per map.
+* Writes **clean per-map output folders** (see below) instead of mirroring the whole game package tree.
+* Ships **one `build_map.py`** per export that turns the raw USD data into a **single `.glb` (glTF 2.0) file with all textures embedded** — which you import straight into Blender. No `bpy`, no Blender scripting, no per-map broken helper scripts.
 * Does not intentionally add/export Unreal light actors as a new Blender lighting rig.
 
 ## Requirements
@@ -21,6 +22,7 @@ Windows/WPF exporter for Session Skate Sim worlds.
 * Windows x64.
 * A legally installed copy of Session Skate Sim.
 * The game's AES key.
+* For the Blender step: any Python 3.8+ (standard library only; `pip install pillow` is an optional extra).
 
 ## Build
 
@@ -40,11 +42,47 @@ The first restore downloads CUE4Parse and CUE4Parse-Conversion from NuGet.
 1. Select the Session installation folder.
 2. Paste the AES key into the AES key field.
 3. Click **Scan game**.
-4. The list is generated from the mounted virtual filesystem and should contain all `.umap` worlds available to the installed build, not a hand-maintained list.
-5. Select maps or click Select all.
-6. Choose an output folder.
-7. Click **EXPORT SELECTED MAPS**.
-8. Open the generated map folder. The exporter writes the converted assets plus `export-manifest.json` and `import_to_blender.py`.
+4. Pick one or more maps from the list (expand *Show individual worlds* if you need a specific raw world package).
+5. Choose an output folder.
+6. Click **EXPORT SELECTED MAPS**.
+7. Open a terminal in the output folder and run:
+
+   ```powershell
+   python build_map.py
+   ```
+
+   (build one map only: `python build_map.py "Maps/LESColemen Park"`)
+
+8. In Blender: **File → Import → glTF 2.0** and pick `Maps/<map name>/<map name>.glb`.
+
+## Export layout
+
+```
+Exports/
+├── build_map.py                     the one and only helper script
+├── README.txt                       the instructions above, offline
+├── maps-export-summary.json
+└── Maps/
+    └── LESColemen Park/             one folder per map - proper files, proper places
+        ├── export-manifest.json
+        ├── LESColemen Park.glb      ← built by build_map.py; import this into Blender
+        ├── build-report.json        ← what was built / skipped / missing textures
+        └── source/                  raw USD/USDA + textures (the master copy)
+```
+
+The old behaviour (a `SessionGame/Content/Art/Env/...` tree plus a per-map
+`import_to_blender.py` that crashed with `ModuleNotFoundError: No module named
+'bpy'`) is gone. `import_to_blender.py` needed Blender's embedded Python and
+gave no standalone model; `build_map.py` runs on plain Python and produces a
+clean asset instead.
+
+## Notes on fidelity
+
+* Geometry is exported in metres, +Y up, glTF conventions — CUE4Parse's exact coordinate mapping.
+* Materials become glTF PBR materials (base colour, normal, ORM metallic/roughness, emissive, alpha masked/translucent).
+* Point instancers (foliage, props) become real shared-mesh instances.
+* Game lights, collision/guide shapes and invisible prims are skipped.
+* Texture files referenced by materials are resolved even in old exports where all-mip export wrote `T_Name_MIP0.png` while materials pointed at `T_Name.png` (the exporter now exports the referenced mip only).
 
 ## Important
 
