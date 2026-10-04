@@ -58,7 +58,7 @@ public partial class MainWindow : Window
             MapCountText.Text = $"{_maps.Count} actual worlds found";
             StatusText.Text = _maps.Count == 0
                 ? "No .umap worlds were found."
-                : "Ready — select one, several, or all worlds.";
+                : "Ready — these are actual UWorld packages; streaming sublevels are consolidated into their parent world during export.";
 
             ExportButton.IsEnabled = _maps.Count > 0;
         }
