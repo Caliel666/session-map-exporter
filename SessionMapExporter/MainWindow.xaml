@@ -1,0 +1,89 @@
+<Window x:Class="SessionMapExporter.MainWindow"
+        xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+        xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+        Title="Session Skate Sim — Map Exporter"
+        Width="1050" Height="760"
+        MinWidth="900" MinHeight="620"
+        Background="#17191D">
+    <Grid Margin="18">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="Auto"/>
+            <RowDefinition Height="*"/>
+            <RowDefinition Height="Auto"/>
+        </Grid.RowDefinitions>
+
+        <TextBlock Text="SESSION SKATE SIM — MAP EXPORTER"
+                   Foreground="White" FontSize="24" FontWeight="SemiBold"
+                   Margin="0,0,0,14"/>
+
+        <Grid Grid.Row="1" Margin="0,0,0,12">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="150"/>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="110"/>
+            </Grid.ColumnDefinitions>
+
+            <TextBlock Text="Game folder" Foreground="#D8D8D8" VerticalAlignment="Center"/>
+            <TextBox x:Name="GameFolderBox" Grid.Column="1" Height="30" Margin="4"/>
+            <Button Grid.Column="2" Content="Browse…" Click="BrowseGame_Click"/>
+
+            <TextBlock Grid.Row="1" Text="AES key" Foreground="#D8D8D8" VerticalAlignment="Center"/>
+            <PasswordBox x:Name="AesKeyBox" Grid.Row="1" Grid.Column="1" Height="30" Margin="4"/>
+            <Button Grid.Row="1" Grid.Column="2" Content="Scan game" Click="Scan_Click"/>
+
+            <TextBlock Grid.Row="2" Text="Output folder" Foreground="#D8D8D8" VerticalAlignment="Center"/>
+            <TextBox x:Name="OutputBox" Grid.Row="2" Grid.Column="1" Height="30" Margin="4"
+                     Text="Exports"/>
+            <Button Grid.Row="2" Grid.Column="2" Content="Browse…" Click="BrowseOutput_Click"/>
+        </Grid>
+
+        <Grid Grid.Row="2">
+            <Grid.RowDefinitions>
+                <RowDefinition Height="Auto"/>
+                <RowDefinition Height="*"/>
+                <RowDefinition Height="Auto"/>
+            </Grid.RowDefinitions>
+
+            <DockPanel Margin="0,0,0,8">
+                <Button DockPanel.Dock="Right" Content="Select all" Click="SelectAll_Click"/>
+                <Button DockPanel.Dock="Right" Content="Clear" Click="Clear_Click"/>
+                <TextBlock x:Name="MapCountText" Text="No game scanned"
+                           Foreground="#C8C8C8" VerticalAlignment="Center"/>
+                <TextBox x:Name="FilterBox" Width="300" Height="28" Margin="20,0,0,0"
+                         ToolTip="Filter map paths" TextChanged="Filter_TextChanged"/>
+            </DockPanel>
+
+            <Border Grid.Row="1" BorderBrush="#343840" BorderThickness="1" CornerRadius="4">
+                <ListBox x:Name="MapList" Background="#101216" Foreground="#EEEEEE"
+                         SelectionMode="Extended" DisplayMemberPath="DisplayName"/>
+            </Border>
+
+            <StackPanel Grid.Row="2" Orientation="Horizontal" Margin="0,10,0,0">
+                <CheckBox x:Name="ExportTexturesBox" Content="Export textures" IsChecked="True"
+                          Foreground="#D8D8D8" VerticalAlignment="Center" Margin="0,0,18,0"/>
+                <CheckBox x:Name="ExportMaterialsBox" Content="Export materials" IsChecked="True"
+                          Foreground="#D8D8D8" VerticalAlignment="Center" Margin="0,0,18,0"/>
+                <CheckBox x:Name="NoLightingBox" Content="Don't export game lighting/lightmaps"
+                          IsChecked="True" Foreground="#D8D8D8" VerticalAlignment="Center"/>
+            </StackPanel>
+        </Grid>
+
+        <Grid Grid.Row="3" Margin="0,12,0,0">
+            <Grid.ColumnDefinitions>
+                <ColumnDefinition Width="*"/>
+                <ColumnDefinition Width="180"/>
+            </Grid.ColumnDefinitions>
+            <TextBlock x:Name="StatusText" Foreground="#BFC5CC"
+                       VerticalAlignment="Center" Text="Ready"/>
+            <Button Grid.Column="1" x:Name="ExportButton"
+                    Content="EXPORT SELECTED MAPS" Click="Export_Click"
+                    IsEnabled="False" Height="42"/>
+        </Grid>
+    </Grid>
+</Window>
