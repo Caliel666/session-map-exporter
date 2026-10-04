@@ -38,10 +38,13 @@ What it does
 ------------
 * Composes the world stage: streaming sublevels (subLayers), world references,
   mesh references, per-instance material overrides and point instancers.
-* Instances every unique mesh only once in the file (shared mesh data).
+* Instances every unique mesh only once in the file (shared mesh data) - the
+  same static mesh used by 200 actors is stored ONCE, not 200 times.
 * Converts Unreal space to glTF space correctly (metres, +Y up, winding, UVs).
 * Skips game lights, collision/debug shapes and invisible prims.
 * Writes  Maps/<Map>/<Map>.glb  plus a  build-report.json  with statistics.
+* Streams the .glb to disk (no multi-GB copies in RAM) and logs progress for
+  every step, so big maps never look frozen.
 """
 
 from __future__ import annotations
@@ -53,6 +56,7 @@ import os
 import re
 import struct
 import sys
+import time
 from array import array
 from pathlib import Path
 
@@ -62,17 +66,47 @@ from pathlib import Path
 
 _VERBOSE = True
 _WARNINGS: list = []
+_WARN_COUNT = 0
+_WARN_CAP = 400
 
 
 def log(msg: str) -> None:
     if _VERBOSE:
-        print(msg, flush=True)
+        try:
+            print(msg, flush=True)
+        except UnicodeEncodeError:      # e.g. cp1252 / cp850 consoles
+            print(msg.encode("ascii", "replace").decode("ascii"), flush=True)
 
 
 def warn(msg: str) -> None:
-    _WARNINGS.append(msg)
+    global _WARN_COUNT
+    _WARN_COUNT += 1
+    if len(_WARNINGS) < _WARN_CAP:
+        _WARNINGS.append(msg)
     if _VERBOSE:
-        print("  [warn] " + msg, flush=True)
+        try:
+            print("  [warn] " + msg, flush=True)
+        except UnicodeEncodeError:
+            print("  [warn] " + msg.encode("ascii", "replace").decode("ascii"),
+                  flush=True)
+
+
+def hsize(n: float) -> str:
+    x = float(n)
+    for unit in ("B", "KB", "MB", "GB"):
+        if x < 1024.0 or unit == "GB":
+            return "%d B" % x if unit == "B" else "%.1f %s" % (x, unit)
+        x /= 1024.0
+    return "%.1f GB" % x
+
+
+def fmat(n: int) -> str:
+    return format(int(n), ",")
+
+
+def _display(p) -> str:
+    """Path for humans (strips the Windows \\\\?\\ long-path prefix)."""
+    return str(p).replace("\\\\?\\", "")
 
 
 # ---------------------------------------------------------------------------
@@ -162,29 +196,64 @@ def _asset_path(s: str) -> str:
     return s[1:-1].replace("\\@", "@")
 
 
-class RawArray:
-    """Un-materialised big numeric array (fast path for huge geometry attrs)."""
+_NUM_CHUNK = 1 << 21                      # parse big arrays in ~2M-char slices
+_BOUNDARY_CHARS = frozenset(" \t\r\n,()[]")
 
-    __slots__ = ("text",)
+
+def _chunks(text: str, step: int = _NUM_CHUNK):
+    """Yields the text in slices that never cut through a number."""
+    n = len(text)
+    pos = 0
+    while pos < n:
+        end = pos + step
+        if end >= n:
+            yield text[pos:]
+            return
+        while end < n and text[end] not in _BOUNDARY_CHARS:
+            end += 1
+        yield text[pos:end]
+        pos = end
+
+
+class RawArray:
+    """Un-materialised big numeric array (fast path for huge geometry attrs).
+
+    Numbers are parsed in bounded chunks (C-speed findall + map) and the
+    result is cached, after which the raw text is released - peak memory
+    stays near the size of the parsed data instead of 3-4x that.
+    """
+
+    __slots__ = ("text", "_cache")
 
     def __init__(self, text: str):
         self.text = text
+        self._cache = {}
 
     def floats(self) -> array:
-        out = array("f")
-        ap = out.append
-        f = float
-        for m in _NUM_RE.finditer(self.text):
-            ap(f(m.group()))
-        return out
+        got = self._cache.get("f")
+        if got is None:
+            out = array("f")
+            ext = out.extend
+            find = _NUM_RE.findall
+            for chunk in _chunks(self.text):
+                ext(array("f", map(float, find(chunk))))
+            self._cache["f"] = out
+            self.text = ""          # raw text no longer needed
+            got = out
+        return got
 
     def ints(self) -> array:
-        out = array("i")
-        ap = out.append
-        i = int
-        for m in _INT_RE.finditer(self.text):
-            ap(i(m.group()))
-        return out
+        got = self._cache.get("i")
+        if got is None:
+            out = array("i")
+            ext = out.extend
+            find = _INT_RE.findall
+            for chunk in _chunks(self.text):
+                ext(array("i", map(int, find(chunk))))
+            self._cache["i"] = out
+            self.text = ""
+            got = out
+        return got
 
     def small_values(self) -> list:
         """Nested-list view for small arrays (e.g. xformOpOrder)."""
@@ -282,6 +351,7 @@ class UsdFile:
         self.sublayers = []
         self.roots = []
         self.by_path = {}
+        self.prim_count = 0
         self._text = ""
         self._parse(read_text_best_effort(path))
 
@@ -306,10 +376,12 @@ class UsdFile:
                 self.roots.append(prim)
                 self._index(prim)
         del self._tokens
+        self._text = None       # free the raw layer text (RawArrays own copies)
 
     def _index(self, prim: Prim):
         prim.path = (prim.parent.path if prim.parent else "") + "/" + prim.name
         self.by_path.setdefault(prim.path, prim)
+        self.prim_count += 1
         for c in prim.children:
             c.parent = prim
             self._index(c)
@@ -533,13 +605,13 @@ def _reference_list(v):
 def read_text_best_effort(path: Path) -> str:
     for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
         try:
-            return path.read_text(encoding=enc)
+            return _norm_path(path).read_text(encoding=enc)
         except (UnicodeDecodeError, UnicodeError):
             continue
         except OSError as exc:
-            warn("cannot read %s: %s" % (path, exc))
+            warn("cannot read %s: %s" % (_display(path), exc))
             return ""
-    return path.read_text(errors="replace")
+    return _norm_path(path).read_text(errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -608,16 +680,24 @@ def token_list(value):
 # Triangle winding is preserved and matches the native glTF export exactly.
 # ---------------------------------------------------------------------------
 
-METERS_PER_UNIT = 0.01
+ROOT_SCALE = 0.01
 
 
-def conv_point(p):
-    return (p[0] * METERS_PER_UNIT, p[2] * METERS_PER_UNIT, p[1] * METERS_PER_UNIT)
+def root_matrix():
+    """Stage space -> glTF space, applied ONCE at the scene root node.
 
-
-def conv_quat(q):
-    w, x, y, z = q[0], q[1], q[2], q[3]
-    return (w, -x, -z, -y)
+    CUE4Parse writes the stage right-handed, Z-up, centimetres, and its own
+    glTF exporter maps UE data as (x, y, z)_ue -> (x, z, -y)_ue * 0.01 - from
+    stage data that is exactly (x, y, z)_usd -> (x, z, y)_usd * 0.01.  Putting
+    that map in a single root matrix keeps every per-vertex / per-node value
+    in raw stage space (no Python-level conversion loops) while producing the
+    identical world-space result; triangle winding is preserved.
+    """
+    s = ROOT_SCALE
+    return [s, 0.0, 0.0, 0.0,
+            0.0, 0.0, s, 0.0,
+            0.0, s, 0.0, 0.0,
+            0.0, 0.0, 0.0, 1.0]
 
 
 def quat_to_matrix(q):
@@ -668,7 +748,10 @@ def node_matrix(translation, rotation, scale):
 
 
 def read_xform(prim: Prim):
-    """Reads xformOpOrder [translate, orient, scale] -> converted glTF TRS."""
+    """Reads xformOpOrder [translate, orient, scale] as raw stage-space TRS.
+
+    The stage->glTF mapping happens once via the scene root matrix, so the
+    values stay exactly as written by the exporter."""
     ops = token_list(prim.get("xformOpOrder"))
     if not ops:
         ops = ["xformOp:translate", "xformOp:orient", "xformOp:scale"]
@@ -685,20 +768,31 @@ def read_xform(prim: Prim):
         if op.endswith(":translate"):
             t = tuple_list(v, 3)
             if t:
-                translation = conv_point(t[0])
+                translation = (float(t[0][0]), float(t[0][1]), float(t[0][2]))
         elif op.endswith(":orient"):
             q = tuple_list(v, 4)
             if q:
-                rotation = conv_quat(q[0])
+                rotation = (float(q[0][0]), float(q[0][1]),
+                            float(q[0][2]), float(q[0][3]))
         elif op.endswith(":scale"):
             s = tuple_list(v, 3)
             if s:
-                scale = tuple(max(abs(c), 1e-9) for c in s[0])
-        elif op.endswith(":transform"):
-            m = matrix4d_rows(v)
-            if m is not None:
-                return matrix_to_trs(conjugate_matrix(m))
+                scale = tuple(max(abs(float(c)), 1e-9) for c in s[0])
     return translation, rotation, scale
+
+
+def prim_matrix(prim: Prim):
+    """Raw stage-space 4x4 of a prim as a glTF column-major node matrix."""
+    ops = token_list(prim.get("xformOpOrder"))
+    for op in ops:
+        attr = prim.attrs.get(op)
+        if attr is not None and attr.value is not None and op.endswith(":transform"):
+            rows = matrix4d_rows(attr.value)
+            if rows is not None:
+                # row-major USD matrix -> column-major glTF matrix
+                return [rows[j][i] for i in range(4) for j in range(4)]
+    t, r, s = read_xform(prim)
+    return node_matrix(t, r, s)
 
 
 def matrix4d_rows(v):
@@ -706,77 +800,6 @@ def matrix4d_rows(v):
     if len(nums) < 16:
         return None
     return [nums[i * 4:i * 4 + 4] for i in range(4)]
-
-
-def conjugate_matrix(rows):
-    """M' = C * M * C^-1 with C = swap(Y,Z), plus cm -> m translation scale."""
-    m = [row[:] for row in rows]
-    m[1], m[2] = m[2], m[1]
-    for row in m:
-        row[1], row[2] = row[2], row[1]
-    m[0][3] *= METERS_PER_UNIT
-    m[1][3] *= METERS_PER_UNIT
-    m[2][3] *= METERS_PER_UNIT
-    return m
-
-
-def matrix_to_trs(rows):
-    """Extracts (translation, rotation, scale); translation already in metres."""
-    r = [rows[0][:3], rows[1][:3], rows[2][:3]]
-    t = (rows[0][3], rows[1][3], rows[2][3])
-
-    sx = math.sqrt(r[0][0] ** 2 + r[0][1] ** 2 + r[0][2] ** 2)
-    sy = math.sqrt(r[1][0] ** 2 + r[1][1] ** 2 + r[1][2] ** 2)
-    sz = math.sqrt(r[2][0] ** 2 + r[2][1] ** 2 + r[2][2] ** 2)
-    scale = (max(sx, 1e-9), max(sy, 1e-9), max(sz, 1e-9))
-
-    n = [[r[0][0] / scale[0], r[0][1] / scale[0], r[0][2] / scale[0]],
-         [r[1][0] / scale[1], r[1][1] / scale[1], r[1][2] / scale[1]],
-         [r[2][0] / scale[2], r[2][1] / scale[2], r[2][2] / scale[2]]]
-    det = (n[0][0] * (n[1][1] * n[2][2] - n[1][2] * n[2][1])
-           - n[0][1] * (n[1][0] * n[2][2] - n[1][2] * n[2][0])
-           + n[0][2] * (n[1][0] * n[2][1] - n[1][1] * n[2][0]))
-    if det < 0:
-        n[0] = [-c for c in n[0]]
-
-    x = (n[0][0], n[0][1], n[0][2])
-    y = (n[1][0], n[1][1], n[1][2])
-    xl = math.sqrt(x[0] ** 2 + x[1] ** 2 + x[2] ** 2) or 1.0
-    x = (x[0] / xl, x[1] / xl, x[2] / xl)
-    d = x[0] * y[0] + x[1] * y[1] + x[2] * y[2]
-    y = (y[0] - d * x[0], y[1] - d * x[1], y[2] - d * x[2])
-    yl = math.sqrt(y[0] ** 2 + y[1] ** 2 + y[2] ** 2) or 1.0
-    y = (y[0] / yl, y[1] / yl, y[2] / yl)
-    z = (x[1] * y[2] - x[2] * y[1],
-         x[2] * y[0] - x[0] * y[2],
-         x[0] * y[1] - x[1] * y[0])
-
-    trace = x[0] + y[1] + z[2]
-    if trace > 0.0:
-        s = 0.5 / math.sqrt(trace + 1.0)
-        w = 0.25 / s
-        qx = (y[2] - z[1]) * s
-        qy = (z[0] - x[2]) * s
-        qz = (x[1] - y[0]) * s
-    elif x[0] > y[1] and x[0] > z[2]:
-        s = 2.0 * math.sqrt(1.0 + x[0] - y[1] - z[2])
-        w = (y[2] - z[1]) / s
-        qx = 0.25 * s
-        qy = (y[0] + x[1]) / s
-        qz = (z[0] + x[2]) / s
-    elif y[1] > z[2]:
-        s = 2.0 * math.sqrt(1.0 + y[1] - x[0] - z[2])
-        w = (z[0] - x[2]) / s
-        qx = (y[0] + x[1]) / s
-        qy = 0.25 * s
-        qz = (z[1] + y[2]) / s
-    else:
-        s = 2.0 * math.sqrt(1.0 + z[2] - x[0] - y[1])
-        w = (x[1] - y[0]) / s
-        qx = (z[0] + x[2]) / s
-        qy = (z[1] + y[2]) / s
-        qz = 0.25 * s
-    return t, (w, qx, qy, qz), scale
 
 
 # ---------------------------------------------------------------------------
@@ -805,6 +828,9 @@ class GLBBuilder:
         self.samplers = [{}]
         self.root_nodes = []
         self._mat_cache = {}
+        self.texture_bytes = 0
+        self.downscale_active = False
+        self.on_texture_embedded = None
 
     def add_view(self, data: bytes, target=None) -> int:
         while len(self.buffer) % 4:
@@ -828,10 +854,13 @@ class GLBBuilder:
         return len(self.accessors) - 1
 
     def add_texture(self, png_bytes: bytes, name: str) -> int:
+        self.texture_bytes += len(png_bytes)
         view = self.add_view(png_bytes)
         self.images.append({"bufferView": view, "mimeType": "image/png",
                             "name": _safe_name(name)})
         self.textures.append({"image": len(self.images) - 1, "sampler": 0})
+        if self.on_texture_embedded is not None:
+            self.on_texture_embedded()
         return len(self.textures) - 1
 
     def add_material(self, mat: dict) -> int:
@@ -853,7 +882,8 @@ class GLBBuilder:
         self.meshes.append({"name": _safe_name(name), "primitives": primitives})
         return len(self.meshes) - 1
 
-    def finish(self, scene_name: str) -> bytes:
+    def write_glb(self, path: Path, scene_name: str) -> int:
+        """Streams the GLB straight to disk - no multi-GB in-RAM copies."""
         gltf = {
             "asset": {"version": "2.0",
                       "generator": "SessionMapExporter build_map.py"},
@@ -873,21 +903,34 @@ class GLBBuilder:
             gltf["textures"] = self.textures
 
         json_bytes = json.dumps(gltf, separators=(",", ":")).encode("utf-8")
+        del gltf
         while len(json_bytes) % 4:
             json_bytes += b" "
 
         bin_len = len(self.buffer)
-        pad = bin_len % 4
-        total = 12 + 8 + len(json_bytes) + 8 + bin_len + (4 - pad if pad else 0)
-        out = bytearray()
-        out += struct.pack("<III", 0x46546C67, 2, total)
-        out += struct.pack("<II", len(json_bytes), 0x4E4F534A)
-        out += json_bytes
-        out += struct.pack("<II", bin_len + (4 - pad if pad else 0), 0x004E4942)
-        out += self.buffer
-        if pad:
-            out += b"\x00\x00\x00"
-        return bytes(out)
+        pad = (-bin_len) % 4
+        total = 12 + 8 + len(json_bytes) + 8 + bin_len + pad
+        if bin_len + pad > 0xFFFFFFFF or len(json_bytes) > 0xFFFFFFFF:
+            raise RuntimeError(
+                "the .glb binary chunk would exceed the 4 GB glTF limit "
+                "(%s of geometry+textures). Re-run with --max-texture-size "
+                "2048 (needs Pillow) to shrink the output." % hsize(bin_len))
+
+        wrote = 0
+        with open(_norm_path(path), "wb") as f:
+            f.write(struct.pack("<III", 0x46546C67, 2, total))
+            f.write(struct.pack("<II", len(json_bytes), 0x4E4F534A))
+            f.write(json_bytes)
+            f.write(struct.pack("<II", bin_len + pad, 0x004E4942))
+            view = memoryview(self.buffer)
+            step = 64 << 20
+            for off in range(0, bin_len, step):
+                f.write(view[off:off + step])
+                wrote = off + step
+            if pad:
+                f.write(b"\x00" * pad)
+        del view
+        return total
 
 
 # ---------------------------------------------------------------------------
@@ -937,13 +980,9 @@ def _extract_geometry(mesh_prim: Prim, key: str) -> Geometry:
         return geo
     geo.vertex_count = n_pts
 
-    # (x, y, z)_usd -> (x, z, y) * 0.01
-    out = array("f", bytes(len(nums) * 4))
-    for i in range(0, n_pts * 3, 3):
-        out[i] = nums[i] * METERS_PER_UNIT
-        out[i + 1] = nums[i + 2] * METERS_PER_UNIT
-        out[i + 2] = nums[i + 1] * METERS_PER_UNIT
-    geo.positions = out
+    # vertices stay in raw stage space; the scene root matrix maps
+    # (x, y, z)_usd -> (x, z, y) * 0.01 once for the whole scene
+    geo.positions = nums
 
     counts = int_list(mesh_prim.get("faceVertexCounts"))
     indices = int_list(mesh_prim.get("faceVertexIndices"))
@@ -970,26 +1009,17 @@ def _extract_geometry(mesh_prim: Prim, key: str) -> Geometry:
         nn = normals.floats() if isinstance(normals, RawArray) else array(
             "f", _flatten_numbers(normals))
         if len(nn) // 3 == n_pts:
-            nout = array("f", bytes(len(nn) * 4))
-            for i in range(0, n_pts * 3, 3):
-                x, z, y = nn[i], nn[i + 2], nn[i + 1]
-                l = math.sqrt(x * x + y * y + z * z)
-                if l > 0.0:
-                    x, y, z = x / l, y / l, z / l
-                else:
-                    x, y, z = 0.0, 0.0, 1.0
-                nout[i], nout[i + 1], nout[i + 2] = x, y, z
-            geo.normals = nout
+            # raw stage space (CUE4Parse normals are unit length); the scene
+            # root matrix rotates them exactly like the vertices
+            geo.normals = nn
 
     st = mesh_prim.get("primvars:st")
     if st is not None:
         uu = st.floats() if isinstance(st, RawArray) else array(
             "f", _flatten_numbers(st))
         if len(uu) // 2 == n_pts:
-            uout = array("f", bytes(len(uu) * 4))
-            for i in range(0, n_pts * 2, 2):
-                uout[i] = uu[i]
-                uout[i + 1] = -uu[i + 1]      # USD v-up -> glTF v-down
+            uout = array("f", uu)
+            uout[1::2] = array("f", (-v for v in uu[1::2]))  # USD v-up -> glTF v-down
             geo.uvs = uout
 
     colors = mesh_prim.get("primvars:displayColor")
@@ -1055,7 +1085,30 @@ def indices_for(geo: Geometry, faces):
 # ---------------------------------------------------------------------------
 
 def _norm_path(p) -> Path:
-    return Path(os.path.normpath(str(p)))
+    """Normalises and applies the Windows \\\\?\\ long-path prefix when needed.
+
+    Session exports nest very deeply (PersistentLevel/<Actor>/<file>.usda),
+    so without this many paths would silently exceed the classic 260-char
+    MAX_PATH limit and every stat()/open() on them would fail.
+    """
+    s = str(p)
+    if s.startswith("\\\\?\\"):
+        return Path(s)
+    s = os.path.normpath(s)
+    if os.name == "nt" and len(s) >= 248 and s[1:2] == ":":
+        s = "\\\\?\\" + s
+    return Path(s)
+
+
+def _win_abs(p) -> Path:
+    """Absolute, long-path-safe form of p (no-op outside Windows)."""
+    p = Path(p)
+    if os.name != "nt":
+        return p
+    s = os.path.abspath(str(p))
+    if not s.startswith("\\\\?\\"):
+        s = "\\\\?\\" + s
+    return Path(s)
 
 
 class Stage:
@@ -1068,9 +1121,19 @@ class Stage:
         f = self.cache.get(rp)
         if f is None:
             if not rp.exists():
-                warn("missing layer: %s" % rp)
+                warn("missing layer: %s" % _display(rp))
                 return None
+            try:
+                size = rp.stat().st_size
+            except OSError:
+                size = 0
+            if size >= 512 * 1024:
+                log("  parsing %s (%s)..." % (rp.name, hsize(size)))
+            t0 = time.perf_counter()
             f = UsdFile(rp)
+            if size >= 512 * 1024:
+                log("  parsed %s: %s prims in %.1fs"
+                    % (rp.name, fmat(f.prim_count), time.perf_counter() - t0))
             self.cache[rp] = f
         return f
 
@@ -1110,17 +1173,37 @@ class Stage:
 # ---------------------------------------------------------------------------
 
 class MaterialLibrary:
+    AUTO_TEXTURE_LIMIT = 3.2 * 1024 * 1024 * 1024   # ~3.2 GB of embedded PNGs
+
     def __init__(self, stage: Stage, glb: GLBBuilder):
         self.stage = stage
         self.glb = glb
         self.texture_cache = {}
         self.png_fallbacks = {}
         self.pillow = None
+        glb.on_texture_embedded = self._autoscale_check
         try:
             import PIL.Image as _img  # noqa
             self.pillow = _img
         except Exception:
             self.pillow = None
+
+    def _autoscale_check(self):
+        """Keeps the .glb below Blender's practical 4 GB import limit."""
+        if _TEXTURE_SCALE_SET or self.glb.downscale_active or \
+                self.glb.texture_bytes < self.AUTO_TEXTURE_LIMIT:
+            return
+        self.glb.downscale_active = True
+        if self.pillow is not None:
+            warn("embedded textures exceed %.1f GB - downscaling the remaining "
+                 "ones to 2048 px (use --max-texture-size to control this)"
+                 % (self.AUTO_TEXTURE_LIMIT / (1024 * 1024 * 1024)))
+            _patch_texture_scaling(2048)
+        else:
+            warn("embedded textures exceed %.1f GB and Pillow is missing - "
+                 "the .glb may break Blender's 4 GB limit; 'pip install pillow' "
+                 "or re-run with --max-texture-size 2048"
+                 % (self.AUTO_TEXTURE_LIMIT / (1024 * 1024 * 1024)))
 
     # -- textures -----------------------------------------------------------
 
@@ -1363,7 +1446,11 @@ class SceneBuilder:
         self.glb = glb
         self.materials = materials
         self.geo_cache = {}      # stage file path + prim path -> Geometry
-        self.mesh_cache = {}     # geo key + instance key -> glTF mesh index
+        self.geo_acc_cache = {}  # geo key -> shared accessor set (vertex data)
+        self.sub_acc_cache = {}  # (geo key, faces) -> index accessor
+        self.missing_acc = {}    # geo key -> index accessor for uncovered faces
+        self.mesh_cache = {}     # (geo key, material signature) -> glTF mesh
+        self._placed = 0
         self.stats = {
             "nodes": 0, "mesh_instances": 0, "instanced_points": 0,
             "unique_meshes": 0, "empty_meshes": 0, "triangles": 0,
@@ -1391,22 +1478,22 @@ class SceneBuilder:
         key = "%s|%s" % (file.path, mesh_prim.path)
         geo = self.geo_cache.get(key)
         if geo is None:
+            t0 = time.perf_counter()
             geo = _extract_geometry(mesh_prim, key)
             geo.source_file = file
             self.geo_cache[key] = geo
+            if geo.vertex_count >= 100_000:
+                log("    mesh %s: %s verts, %s tris (%.1fs)"
+                    % (mesh_prim.name, fmat(geo.vertex_count),
+                       fmat(geo.triangles), time.perf_counter() - t0))
         return geo
 
-    def _gltf_mesh(self, geo: Geometry, instance_prim, instance_file, name):
-        if geo.positions is None or not geo.face_offsets:
-            self.stats["empty_meshes"] += 1
-            return None
-        cache_key = "%s|%s" % (
-            geo.key,
-            (str(instance_file.path) + instance_prim.path) if instance_prim is not None else "-")
-        mesh_idx = self.mesh_cache.get(cache_key)
-        if mesh_idx is not None:
-            return mesh_idx
-
+    def _geo_accessors(self, geo: Geometry, mesh_prim: Prim):
+        """POSITION/NORMAL/... accessors, built ONCE per unique mesh and
+        shared by every instance of it (glTF accessors are reusable)."""
+        acc = self.geo_acc_cache.get(geo.key)
+        if acc is not None:
+            return acc
         n_pts = geo.vertex_count
         mins = [geo.positions[i] for i in (0, 1, 2)]
         maxs = list(mins)
@@ -1434,34 +1521,85 @@ class SceneBuilder:
             attrs["COLOR_0"] = self.glb.add_accessor(
                 self.glb.add_view(geo.colors.tobytes(), 34962), 5126, n_pts, "VEC4")
 
-        primitives = []
-        subsets = geo.subsets if geo.subsets else [(None, None, None)]
-        covered = set()
-        for _n, faces, _m in geo.subsets:
-            if faces:
-                covered.update(faces)
+        self.geo_acc_cache[geo.key] = attrs
+        self._release_geo_arrays(geo, mesh_prim)
+        return attrs
 
-        for s_name, faces, _mat in subsets:
+    def _release_geo_arrays(self, geo: Geometry, mesh_prim: Prim):
+        """Vertex data now lives in the GLB buffer - drop the Python copies
+        and the parsed source arrays so big maps never sit in RAM twice."""
+        geo.positions = geo.normals = geo.uvs = geo.colors = None
+        if mesh_prim is None:
+            return
+        for name in ("points", "primvars:normals", "primvars:st",
+                     "primvars:displayColor", "primvars:displayOpacity",
+                     "faceVertexCounts", "faceVertexIndices"):
+            a = mesh_prim.attrs.get(name)
+            if a is not None and isinstance(a.value, RawArray):
+                a.value._cache.clear()
+
+    def _subset_acc(self, geo: Geometry, faces):
+        if faces is None:
+            key = (geo.key, 0, 0)
+        else:
+            key = (geo.key, len(faces), hash(faces.tobytes()))
+        got = self.sub_acc_cache.get(key)
+        if got is None:
             idx_list = indices_for(geo, faces)
             if not len(idx_list):
-                continue
-            mat_idx = self._material_for(geo, s_name, instance_prim, instance_file)
-            idx_acc = self.glb.add_accessor(
+                self.sub_acc_cache[key] = 0
+                return None
+            got = self.glb.add_accessor(
                 self.glb.add_view(idx_list.tobytes(), 34963), 5125,
                 len(idx_list), "SCALAR")
-            prim = {"mode": 4, "indices": idx_acc, "attributes": dict(attrs)}
-            if mat_idx is not None:
-                prim["material"] = mat_idx
-            primitives.append(prim)
+            self.sub_acc_cache[key] = got
+        return None if got == 0 else got
 
-        if geo.subsets and covered:
-            missing = array("i", (fi for fi in range(len(geo.face_offsets))
-                                  if fi not in covered))
-            idx_list = indices_for(geo, missing)
-            if len(idx_list):
-                idx_acc = self.glb.add_accessor(
-                    self.glb.add_view(idx_list.tobytes(), 34963), 5125,
-                    len(idx_list), "SCALAR")
+    def _missing_acc(self, geo: Geometry):
+        got = self.missing_acc.get(geo.key)
+        if got is None:
+            covered = set()
+            for _n, faces, _m in geo.subsets:
+                if faces:
+                    covered.update(faces)
+            idx_list = array("i")
+            if covered:
+                missing = array("i", (fi for fi in range(len(geo.face_offsets))
+                                      if fi not in covered))
+                idx_list = indices_for(geo, missing)
+            if not len(idx_list):
+                self.missing_acc[geo.key] = 0
+                return None
+            got = self.glb.add_accessor(
+                self.glb.add_view(idx_list.tobytes(), 34963), 5125,
+                len(idx_list), "SCALAR")
+            self.missing_acc[geo.key] = got
+        return None if got == 0 else got
+
+    def _gltf_mesh(self, geo: Geometry, mesh_prim: Prim, instance_prim,
+                   instance_file, name):
+        if not geo.face_offsets or geo.vertex_count == 0:
+            self.stats["empty_meshes"] += 1
+            return None
+        attrs = self._geo_accessors(geo, mesh_prim)
+
+        primitives = []
+        sig = []
+        subsets = geo.subsets if geo.subsets else [(None, None, None)]
+        for s_name, faces, _mat in subsets:
+            idx_acc = self._subset_acc(geo, faces)
+            if idx_acc is None:
+                continue
+            mat_idx = self._material_for(geo, s_name, instance_prim, instance_file)
+            sig.append(mat_idx)
+            prim_dict = {"mode": 4, "indices": idx_acc, "attributes": dict(attrs)}
+            if mat_idx is not None:
+                prim_dict["material"] = mat_idx
+            primitives.append(prim_dict)
+
+        if geo.subsets:
+            idx_acc = self._missing_acc(geo)
+            if idx_acc is not None:
                 primitives.append({"mode": 4, "indices": idx_acc,
                                    "attributes": dict(attrs)})
 
@@ -1469,10 +1607,16 @@ class SceneBuilder:
             self.stats["empty_meshes"] += 1
             return None
 
+        # instances with identical material mapping share the whole mesh
+        mesh_key = (geo.key, tuple(sig))
+        mesh_idx = self.mesh_cache.get(mesh_key)
+        if mesh_idx is not None:
+            return mesh_idx
+
         self.stats["unique_meshes"] += 1
         self.stats["triangles"] += geo.triangles
         mesh_idx = self.glb.add_mesh(name, primitives)
-        self.mesh_cache[cache_key] = mesh_idx
+        self.mesh_cache[mesh_key] = mesh_idx
         return mesh_idx
 
     def _material_for(self, geo: Geometry, subset_name, instance_prim, instance_file):
@@ -1552,24 +1696,24 @@ class SceneBuilder:
                 self.walk(child, file, children, depth + 1)
             if children:
                 # apply the level-reference transform (usually identity)
-                t_, r_, s_ = read_xform(prim)
                 node_idx = self.glb.add_node(
-                    prim.name, children=children,
-                    matrix=node_matrix(t_, r_, s_))
+                    prim.name, children=children, matrix=prim_matrix(prim))
                 parent_children.append(node_idx)
                 self.stats["nodes"] += 1
             return
 
         geo = self._geometry_of(f, target)
-        mesh_idx = self._gltf_mesh(geo, prim, file, target.name)
+        mesh_idx = self._gltf_mesh(geo, target, prim, file, target.name)
         if mesh_idx is None:
             return
-        t, r, s = read_xform(prim)
-        node_idx = self.glb.add_node(prim.name, matrix=node_matrix(t, r, s),
+        node_idx = self.glb.add_node(prim.name, matrix=prim_matrix(prim),
                                      mesh=mesh_idx)
         parent_children.append(node_idx)
         self.stats["mesh_instances"] += 1
         self.stats["nodes"] += 1
+        self._placed += 1
+        if self._placed % 50 == 0:
+            log("    ... %d meshes placed (at '%s')" % (self._placed, prim.name))
 
         kids = []
         for child in prim.children:
@@ -1601,7 +1745,8 @@ class SceneBuilder:
                 proto_meshes.append(None)
                 continue
             geo = self._geometry_of(f, target)
-            proto_meshes.append(self._gltf_mesh(geo, proto, file, target.name))
+            proto_meshes.append(self._gltf_mesh(geo, target, proto, file,
+                                                target.name))
 
         proto_indices = int_list(prim.get("protoIndices"))
         positions = prim.get("positions")
@@ -1615,17 +1760,21 @@ class SceneBuilder:
             array("f", _flatten_numbers(scales))
 
         count = len(positions) // 3
+        if count >= 100:
+            log("    instancer %s: %s instances" % (prim.name, fmat(count)))
         inst_children = []
         for i in range(count):
             mesh_idx = proto_meshes[proto_indices[i]] \
                 if i < len(proto_indices) and proto_indices[i] < len(proto_meshes) else None
             if mesh_idx is None:
                 continue
-            px = positions[i * 3] * METERS_PER_UNIT
-            py = positions[i * 3 + 2] * METERS_PER_UNIT
-            pz = positions[i * 3 + 1] * METERS_PER_UNIT
+            # raw stage-space TRS; the scene root matrix maps it to glTF space
+            px = positions[i * 3]
+            py = positions[i * 3 + 1]
+            pz = positions[i * 3 + 2]
             if i * 4 + 3 < len(orientations):
-                q = conv_quat(orientations[i * 4:i * 4 + 4])
+                q = (orientations[i * 4], orientations[i * 4 + 1],
+                     orientations[i * 4 + 2], orientations[i * 4 + 3])
             else:
                 q = (1.0, 0.0, 0.0, 0.0)
             if i * 3 + 2 < len(scales):
@@ -1651,11 +1800,29 @@ class SceneBuilder:
 
 def find_map_dirs(base: Path):
     maps = base / "Maps"
-    if maps.is_dir():
-        return sorted(p for p in maps.iterdir() if p.is_dir())
-    if (base / "source").is_dir() or (base / "export-manifest.json").exists():
-        return [base]
+    if _norm_path(maps).is_dir():
+        return sorted(p for p in _norm_path(maps).iterdir() if p.is_dir())
+    if _norm_path(base / "source").is_dir() or \
+            _norm_path(base / "export-manifest.json").exists():
+        return [_win_abs(base)]
     return []
+
+
+def _peek_scope(p: Path) -> bool:
+    """True if the file starts like a Scope-rooted world stage (reads 4 KB)."""
+    try:
+        with open(_norm_path(p), "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False
+    if b"def Scope" in head:
+        return True
+    if b"\x00" in head:                      # possibly UTF-16
+        try:
+            return "def Scope" in head.decode("utf-16-le", "replace")
+        except Exception:
+            return False
+    return False
 
 
 def discover_world_file(map_dir: Path):
@@ -1677,36 +1844,72 @@ def discover_world_file(map_dir: Path):
 
     src = map_dir / "source"
     search_root = src if src.is_dir() else map_dir
-    best, best_size = None, -1
+    log("scanning %s for the world stage..." % _display(search_root))
+    t0 = time.perf_counter()
+    candidates = []
+    seen = 0
     for p in search_root.rglob("*.usda"):
+        seen += 1
+        if seen % 500 == 0:
+            log("  ... %d .usda files scanned" % seen)
         try:
-            size = p.stat().st_size
+            size = _norm_path(p).stat().st_size
         except OSError:
             continue
-        if size <= best_size:
-            continue
-        head = read_text_best_effort(p)[:4000]
-        if "def Scope" in head:
-            best, best_size = p, size
-    if best is None:
-        for p in search_root.rglob("*.usda"):
-            try:
-                size = p.stat().st_size
-            except OSError:
-                continue
-            if size > best_size:
-                best, best_size = p, size
-    return best
+        candidates.append((size, p))
+    log("  %d .usda file(s) found in %.1fs" % (seen, time.perf_counter() - t0))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: t[0], reverse=True)   # largest first
+    for size, p in candidates:
+        if size > 0 and _peek_scope(p):
+            return p
+    return candidates[0][1]
 
 
 # ---------------------------------------------------------------------------
 # build
 # ---------------------------------------------------------------------------
 
-def build_map(map_dir: Path, out_path: Path = None) -> dict:
-    global _WARNINGS
-    _WARNINGS = []
+def _peak_rss_bytes():
+    """Peak process memory, for the build report (best effort)."""
+    try:
+        if os.name == "nt":
+            import ctypes
+            from ctypes import wintypes
 
+            class _PMC(ctypes.Structure):
+                _fields_ = [
+                    ("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t)]
+
+            pmc = _PMC()
+            pmc.cb = ctypes.sizeof(_PMC)
+            if ctypes.windll.psapi.GetProcessMemoryInfo(
+                    ctypes.windll.kernel32.GetCurrentProcess(),
+                    ctypes.byref(pmc), pmc.cb):
+                return int(pmc.PeakWorkingSetSize)
+            return None
+        import resource
+        return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss * 1024
+    except Exception:
+        return None
+
+
+def build_map(map_dir: Path, out_path: Path = None) -> dict:
+    global _WARNINGS, _WARN_COUNT
+    _WARNINGS = []
+    _WARN_COUNT = 0
+
+    t_start = time.perf_counter()
+    map_dir = _norm_path(map_dir)
     map_name = map_dir.name
     log("")
     log("=== %s ===" % map_name)
@@ -1720,9 +1923,12 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
         rel = world_file.relative_to(map_dir)
     except ValueError:
         rel = world_file
-    log("world stage: %s" % rel)
+    log("world stage: %s" % _display(rel))
 
     stage = Stage(world_file)
+    log("stage composed: %d layer(s) in %.1fs"
+        % (len(stage.cache), time.perf_counter() - t_start))
+
     glb = GLBBuilder()
     materials = MaterialLibrary(stage, glb)
     scene = SceneBuilder(stage, glb, materials)
@@ -1743,42 +1949,62 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
                 for rp in sub_file.roots:
                     scene.walk(rp, sub_file, children)
 
-    root_idx = glb.add_node(map_name, children=children or None)
+    st = scene.stats
+    log("scene built in %.1fs: %s nodes, %s unique meshes, %s mesh "
+        "instances, %s instanced points, %s triangles"
+        % (time.perf_counter() - t_start, fmat(st["nodes"]),
+           fmat(st["unique_meshes"]), fmat(st["mesh_instances"]),
+           fmat(st["instanced_points"]), fmat(st["triangles"])))
+
+    # the root node carries the whole stage->glTF space conversion
+    root_idx = glb.add_node(map_name, children=children or None,
+                            matrix=root_matrix())
     glb.root_nodes.append(root_idx)
 
     if out_path is None:
         out_path = map_dir / (_safe_file_name(map_name) + ".glb")
-    data = glb.finish(map_name)
-    out_path.write_bytes(data)
+    out_path = _norm_path(out_path)
+    log("writing %s (%s of geometry+textures)..."
+        % (_display(out_path), hsize(len(glb.buffer))))
+    t_write = time.perf_counter()
+    total = glb.write_glb(out_path, map_name)
+    log("wrote %.2f MB in %.1fs" % (total / (1024 * 1024),
+                                    time.perf_counter() - t_write))
 
+    peak = _peak_rss_bytes()
     report = {
         "map": map_name,
         "ok": True,
-        "output": str(out_path),
-        "size_mb": round(len(data) / (1024 * 1024), 2),
-        "world_stage": str(world_file),
+        "output": _display(out_path),
+        "size_mb": round(total / (1024 * 1024), 2),
+        "world_stage": _display(world_file),
         "stats": scene.stats,
         "materials": len(glb.materials),
         "textures": len(glb.images),
+        "texture_payload_mb": round(glb.texture_bytes / (1024 * 1024), 2),
+        "layers_parsed": len(stage.cache),
+        "elapsed_sec": round(time.perf_counter() - t_start, 1),
+        "peak_memory_mb": round(peak / (1024 * 1024), 1) if peak else None,
         "warnings": list(_WARNINGS),
+        "warnings_total": _WARN_COUNT,
     }
-    (map_dir / "build-report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8")
+    try:
+        (map_dir / "build-report.json").write_text(
+            json.dumps(report, indent=2), encoding="utf-8")
+    except OSError as exc:
+        warn("cannot write build-report.json: %s" % exc)
 
-    st = scene.stats
-    log("nodes=%d unique_meshes=%d instances=%d instanced_points=%d "
-        "triangles=%d materials=%d textures=%d"
-        % (st["nodes"], st["unique_meshes"], st["mesh_instances"],
-           st["instanced_points"], st["triangles"], len(glb.materials),
-           len(glb.images)))
-    log("output: %s  (%.2f MB)" % (out_path, report["size_mb"]))
-    if _WARNINGS:
-        log("%d warning(s) - see build-report.json" % len(_WARNINGS))
+    log("output: %s  (%.2f MB)" % (_display(out_path), report["size_mb"]))
+    if _WARN_COUNT:
+        log("%d warning(s) - see build-report.json" % _WARN_COUNT)
     return report
 
 
+_TEXTURE_SCALE_SET = False     # True when --max-texture-size was given
+
+
 def main(argv=None) -> int:
-    global _VERBOSE
+    global _VERBOSE, _TEXTURE_SCALE_SET
     ap = argparse.ArgumentParser(
         description="Build Session map exports into single .glb files")
     ap.add_argument("map", nargs="?",
@@ -1791,19 +2017,20 @@ def main(argv=None) -> int:
     args = ap.parse_args(argv)
     _VERBOSE = not args.quiet
 
-    script_dir = Path(__file__).resolve().parent
+    t_start = time.perf_counter()
+    script_dir = _win_abs(Path(__file__).resolve().parent)
 
     if args.map:
         target = Path(args.map)
         if not target.is_absolute():
             target = script_dir / target
-        map_dirs = [target]
+        map_dirs = [_win_abs(target)]
     else:
         map_dirs = find_map_dirs(script_dir)
 
     if args.list:
         for m in map_dirs:
-            print(m.name)
+            print(_display(m))
         return 0
 
     if not map_dirs:
@@ -1819,29 +2046,38 @@ def main(argv=None) -> int:
         except ImportError:
             print("--max-texture-size requires Pillow: pip install pillow")
             return 2
+        _TEXTURE_SCALE_SET = True
         _patch_texture_scaling(args.max_texture_size)
 
     built = failed = 0
-    for m in map_dirs:
-        if not m.is_dir():
-            print("not a folder: %s" % m)
-            failed += 1
-            continue
-        try:
-            out = Path(args.out) if (args.out and len(map_dirs) == 1) else None
-            if build_map(m, out).get("ok"):
-                built += 1
-            else:
+    try:
+        for m in map_dirs:
+            if not m.is_dir():
+                print("not a folder: %s" % _display(m))
                 failed += 1
-        except Exception:
-            import traceback
-            traceback.print_exc()
-            print("FAILED %s" % m.name)
-            failed += 1
+                continue
+            try:
+                out = _norm_path(Path(args.out)) \
+                    if (args.out and len(map_dirs) == 1) else None
+                if build_map(m, out).get("ok"):
+                    built += 1
+                else:
+                    failed += 1
+            except KeyboardInterrupt:
+                raise
+            except Exception:
+                import traceback
+                traceback.print_exc()
+                print("FAILED %s" % m.name)
+                failed += 1
+    except KeyboardInterrupt:
+        print("\nInterrupted - no partial .glb was left behind.")
+        return 130
 
     print("")
-    print("Done. %d built, %d failed. Import the .glb via "
-          "Blender: File -> Import -> glTF 2.0" % (built, failed))
+    print("Done in %.1fs. %d built, %d failed. Import the .glb via "
+          "Blender: File -> Import -> glTF 2.0"
+          % (time.perf_counter() - t_start, built, failed))
     return 0 if failed == 0 else 1
 
 
@@ -1876,5 +2112,5 @@ def _patch_texture_scaling(n: int):
 
 if __name__ == "__main__":
     sys.exit(main())
-"""" + "\n";
+"""";
 }
