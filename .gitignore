@@ -1,0 +1,43 @@
+# Visual Studio / .NET
+.vs/
+**/bin/
+**/obj/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+# Rider / ReSharper
+.idea/
+_ReSharper*/
+*.DotSettings.user
+
+# NuGet
+*.nupkg
+*.snupkg
+.nuget/
+packages/
+
+# Build / publish output
+artifacts/
+publish/
+release/
+
+# OS
+Thumbs.db
+.DS_Store
+
+# Local secrets / keys
+*.key
+*.aes
+.env
+.env.*
+
+# Session/game data — never commit installed game content
+*.pak
+*.utoc
+*.ucas
+*.uasset
+*.umap
+*.ubulk
+*.uptnl
