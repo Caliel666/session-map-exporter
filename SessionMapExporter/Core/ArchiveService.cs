@@ -129,9 +129,9 @@ public sealed class ArchiveService
                 results = results.Select(r => new
                 {
                     r.ObjectPath,
-                    r.ExportPath,
                     r.Success,
-                    r.Message
+                    diskFilePaths = r.DiskFilePaths?.ToArray(),
+                    error = r.Error?.ToString()
                 }).ToArray()
             };
 
