@@ -1,9 +1,8 @@
-using System.Reflection;
+using System.IO;
 using System.Text.Json;
 using CUE4Parse;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
-using CUE4Parse.UE4.Assets.Exports.Engine;
 using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion;
@@ -48,7 +47,6 @@ public sealed class ArchiveService
         var provider = new DefaultFileProvider(pakDirectory, SearchOption.TopDirectoryOnly, true, version);
         provider.Initialize();
         provider.SubmitKey(new FGuid(), new FAesKey(normalized));
-        provider.LoadLocalization(CUE4Parse.UE4.Objects.Core.Misc.ELanguage.English);
         Provider = provider;
     }
 
@@ -90,14 +88,12 @@ public sealed class ArchiveService
             progress?.Report($"Loading {map.DisplayName}…");
 
             var package = Provider.LoadPackage(map.Path);
-            var world = package.GetExports().OfType<UWorld>().FirstOrDefault();
 
-            if (world is null)
-            {
-                // Some packages expose the world through LoadObject rather than the export enumeration.
-                var obj = Provider.LoadObject(map.Path);
-                world = obj as UWorld;
-            }
+            // Avoid a hard reference to a version-specific UWorld namespace.
+            // Current CUE4Parse packages expose UWorld through IPackage.GetExports(),
+            // and ExportSession accepts the resulting UObject directly.
+            var world = package.GetExports()
+                .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
 
             if (world is null)
             {
