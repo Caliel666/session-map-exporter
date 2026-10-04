@@ -352,7 +352,7 @@ public sealed class ArchiveService
 
         for (var i = 0; i < line.Length; i++)
         {
-            if (line[i] == '"' && (i == 0 || line[i - 1] != '\'))
+            if (line[i] == '"' && (i == 0 || line[i - 1] != '\\'))
                 inString = !inString;
             else if (!inString)
             {
