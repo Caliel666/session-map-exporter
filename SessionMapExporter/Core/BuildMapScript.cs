@@ -56,6 +56,7 @@ import os
 import re
 import struct
 import sys
+import threading
 import time
 from array import array
 from pathlib import Path
@@ -107,6 +108,51 @@ def fmat(n: int) -> str:
 def _display(p) -> str:
     """Path for humans (strips the Windows \\\\?\\ long-path prefix)."""
     return str(p).replace("\\\\?\\", "")
+
+
+class _Heartbeat:
+    """Daemon thread that proves the build is alive during long silent steps.
+
+    Pure-Python work (parsing layers, building accessors, embedding textures)
+    can run for minutes without reaching the next log line; the heartbeat
+    prints what is currently being worked on every 30 s so a healthy build
+    never looks frozen.  It also names the exact step if you ever need to
+    report a stall.
+    """
+
+    INTERVAL = 30.0
+
+    def __init__(self):
+        self.label = "starting"
+        self._t0 = time.perf_counter()
+        self._stop = threading.Event()
+        self._thread = None
+
+    def start(self):
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, daemon=True)
+            self._thread.start()
+
+    def step(self, label):
+        self.label = label
+        self._t0 = time.perf_counter()
+
+    def _run(self):
+        while not self._stop.wait(self.INTERVAL):
+            try:
+                print("  [working %.0fs] %s"
+                      % (time.perf_counter() - self._t0, self.label),
+                      flush=True)
+            except Exception:
+                pass
+
+
+_HB = _Heartbeat()
+
+
+def step(label: str) -> None:
+    """Marks the current work item; echoed by the liveness heartbeat."""
+    _HB.step(label)
 
 
 # ---------------------------------------------------------------------------
@@ -603,15 +649,39 @@ def _reference_list(v):
 
 
 def read_text_best_effort(path: Path) -> str:
+    p = _norm_path(path)
+    try:
+        with open(p, "rb") as fh:
+            head = fh.read(65536)
+    except OSError as exc:
+        warn("cannot read %s: %s" % (_display(path), exc))
+        return ""
+
+    # Binary guard: a .usdc / .zip / .png read as text would "decode" into
+    # GB of garbage that the tokenizer then chews on for hours.  Never feed
+    # binary data to the parser - skip it loudly instead.
+    if head[:8] == b"PXR-USDC":
+        warn("skipping binary usdc layer (unsupported): %s" % _display(path))
+        return ""
+    if head[:4] in (b"PK\x03\x04", b"\x89PNG", b"RIFF") or head[:4] == b"PXR-":
+        warn("skipping binary layer: %s" % _display(path))
+        return ""
+    if head[:2] not in (b"\xff\xfe", b"\xfe\xff") and \
+            head.count(0) * 20 > len(head):
+        probe = head.decode("utf-16-le", "replace")
+        if "usda" not in probe[:200] and "def " not in probe[:2000]:
+            warn("skipping binary-looking layer: %s" % _display(path))
+            return ""
+
     for enc in ("utf-8-sig", "utf-8", "utf-16", "latin-1"):
         try:
-            return _norm_path(path).read_text(encoding=enc)
+            return p.read_text(encoding=enc)
         except (UnicodeDecodeError, UnicodeError):
             continue
         except OSError as exc:
             warn("cannot read %s: %s" % (_display(path), exc))
             return ""
-    return _norm_path(path).read_text(errors="replace")
+    return p.read_text(errors="replace")
 
 
 # ---------------------------------------------------------------------------
@@ -829,6 +899,7 @@ class GLBBuilder:
         self.root_nodes = []
         self._mat_cache = {}
         self.texture_bytes = 0
+        self._tex_count = 0
         self.downscale_active = False
         self.on_texture_embedded = None
 
@@ -855,6 +926,12 @@ class GLBBuilder:
 
     def add_texture(self, png_bytes: bytes, name: str) -> int:
         self.texture_bytes += len(png_bytes)
+        self._tex_count += 1
+        step("embedding textures (%d done, %s total - at %s)"
+             % (self._tex_count, hsize(self.texture_bytes), name))
+        if self._tex_count % 10 == 0:
+            log("    textures: %d embedded, %s so far (at %s)"
+                % (self._tex_count, hsize(self.texture_bytes), name))
         view = self.add_view(png_bytes)
         self.images.append({"bufferView": view, "mimeType": "image/png",
                             "name": _safe_name(name)})
@@ -923,10 +1000,17 @@ class GLBBuilder:
             f.write(json_bytes)
             f.write(struct.pack("<II", bin_len + pad, 0x004E4942))
             view = memoryview(self.buffer)
-            step = 64 << 20
-            for off in range(0, bin_len, step):
-                f.write(view[off:off + step])
-                wrote = off + step
+            chunk = 64 << 20
+            gb = 1 << 30
+            next_gb = gb
+            step("writing .glb (%s)" % hsize(bin_len))
+            for off in range(0, bin_len, chunk):
+                f.write(view[off:off + chunk])
+                wrote = off + chunk
+                if bin_len > gb and wrote >= next_gb:
+                    log("    ... %.1f / %s written"
+                        % (min(wrote, bin_len) / gb, hsize(bin_len)))
+                    next_gb += gb
             if pad:
                 f.write(b"\x00" * pad)
         del view
@@ -1127,14 +1211,13 @@ class Stage:
                 size = rp.stat().st_size
             except OSError:
                 size = 0
-            if size >= 512 * 1024:
-                log("  parsing %s (%s)..." % (rp.name, hsize(size)))
+            step("parsing layer %s (%s)" % (rp.name, hsize(size)))
             t0 = time.perf_counter()
             f = UsdFile(rp)
-            if size >= 512 * 1024:
-                log("  parsed %s: %s prims in %.1fs"
-                    % (rp.name, fmat(f.prim_count), time.perf_counter() - t0))
             self.cache[rp] = f
+            log("  layer %s: %s prims, %s, %.2fs"
+                % (rp.name, fmat(f.prim_count), hsize(size),
+                   time.perf_counter() - t0))
         return f
 
     def resolve_asset(self, from_file: UsdFile, asset: str):
@@ -1238,6 +1321,7 @@ class MaterialLibrary:
         if key in self.texture_cache:
             return self.texture_cache[key]
         try:
+            step("reading texture %s" % png.name)
             data = png.read_bytes()
         except OSError as exc:
             warn("texture unreadable: %s (%s)" % (png, exc))
@@ -1256,6 +1340,7 @@ class MaterialLibrary:
         try:
             import io
             from PIL import Image
+            step("ORM swizzle %s" % png.name)
             img = Image.open(png).convert("RGBA")
             r, g, b, a = img.split()
             merged = Image.merge("RGBA", (r, b, g, a))
@@ -1451,6 +1536,7 @@ class SceneBuilder:
         self.missing_acc = {}    # geo key -> index accessor for uncovered faces
         self.mesh_cache = {}     # (geo key, material signature) -> glTF mesh
         self._placed = 0
+        self._visited = 0
         self.stats = {
             "nodes": 0, "mesh_instances": 0, "instanced_points": 0,
             "unique_meshes": 0, "empty_meshes": 0, "triangles": 0,
@@ -1495,6 +1581,11 @@ class SceneBuilder:
         if acc is not None:
             return acc
         n_pts = geo.vertex_count
+        if n_pts >= 50_000:
+            log("    building accessors for %s (%s verts)..."
+                % (geo.name, fmat(n_pts)))
+            step("building accessors for %s (%s verts)"
+                 % (geo.name, fmat(n_pts)))
         mins = [geo.positions[i] for i in (0, 1, 2)]
         maxs = list(mins)
         p = geo.positions
@@ -1645,6 +1736,11 @@ class SceneBuilder:
     def walk(self, prim: Prim, file: UsdFile, parent_children: list, depth=0):
         if depth > 24 or prim is None:
             return
+        self._visited += 1
+        if self._visited % 500 == 0:
+            log("    walked %s prims (at '%s')"
+                % (fmat(self._visited), prim.name))
+            step("walking scene (%s prims visited)" % fmat(self._visited))
         if not prim.is_visible():
             self.stats["skipped_invisible"] += 1
             return
@@ -1714,6 +1810,9 @@ class SceneBuilder:
         self._placed += 1
         if self._placed % 50 == 0:
             log("    ... %d meshes placed (at '%s')" % (self._placed, prim.name))
+        elif self._placed % 5 == 0:
+            step("placing meshes (%d placed, at '%s')"
+                 % (self._placed, prim.name))
 
         kids = []
         for child in prim.children:
@@ -1762,8 +1861,13 @@ class SceneBuilder:
         count = len(positions) // 3
         if count >= 100:
             log("    instancer %s: %s instances" % (prim.name, fmat(count)))
+        if count >= 1000:
+            step("instancing %s (%s instances)" % (prim.name, fmat(count)))
         inst_children = []
         for i in range(count):
+            if i and i % 25000 == 0:
+                log("    ... %s / %s instances placed"
+                    % (fmat(i), fmat(count)))
             mesh_idx = proto_meshes[proto_indices[i]] \
                 if i < len(proto_indices) and proto_indices[i] < len(proto_meshes) else None
             if mesh_idx is None:
@@ -1852,6 +1956,7 @@ def discover_world_file(map_dir: Path):
         seen += 1
         if seen % 500 == 0:
             log("  ... %d .usda files scanned" % seen)
+            step("scanning for world stage (%d files)" % seen)
         try:
             size = _norm_path(p).stat().st_size
         except OSError:
@@ -1913,6 +2018,8 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
     map_name = map_dir.name
     log("")
     log("=== %s ===" % map_name)
+    _HB.start()
+    step("discovering world stage")
 
     world_file = discover_world_file(map_dir)
     if world_file is None:
@@ -1925,10 +2032,13 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
         rel = world_file
     log("world stage: %s" % _display(rel))
 
+    step("composing world stage")
     stage = Stage(world_file)
     log("stage composed: %d layer(s) in %.1fs"
         % (len(stage.cache), time.perf_counter() - t_start))
 
+    log("building scene: referenced layers load on demand...")
+    step("building scene graph")
     glb = GLBBuilder()
     materials = MaterialLibrary(stage, glb)
     scene = SceneBuilder(stage, glb, materials)
@@ -2016,6 +2126,14 @@ def main(argv=None) -> int:
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args(argv)
     _VERBOSE = not args.quiet
+    _HB.start()
+    try:
+        import PIL  # noqa
+    except ImportError:
+        print("tip: 'pip install pillow' is recommended for large maps - it "
+              "fixes roughness/metallic channels and auto-downscales textures "
+              "above 3.2 GB so the .glb stays under Blender's 4 GB import "
+              "limit.")
 
     t_start = time.perf_counter()
     script_dir = _win_abs(Path(__file__).resolve().parent)
