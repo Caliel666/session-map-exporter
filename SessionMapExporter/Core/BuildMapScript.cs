@@ -350,6 +350,17 @@ def _tokens_to_value(tokens, i):
 # parsed object model
 # ---------------------------------------------------------------------------
 
+_STALL_PEEKS = 50_000          # peeks without any advance = parser bug
+
+
+class _ParseStall(Exception):
+    """Guard: the parser stopped consuming tokens (bug or corrupt layer).
+
+    Raised instead of hanging forever; Stage._load catches it and skips the
+    offending layer so one bad file can never stall a whole map build.
+    """
+
+
 class Attr:
     __slots__ = ("type_name", "value", "metadata")
 
@@ -406,6 +417,7 @@ class UsdFile:
         tokens = tokenize(text)
         self._tokens = tokens
         self._i = 0
+        self._stall = 0
 
         if self._peek_is("punct", "("):
             meta = self._parse_metadata_block()
@@ -435,11 +447,17 @@ class UsdFile:
     # -- token helpers ------------------------------------------------------
 
     def _peek(self):
-        return self._tokens[self._i] if self._i < len(self._tokens) else None
+        if self._i >= len(self._tokens):
+            return None
+        self._stall += 1
+        if self._stall > _STALL_PEEKS:
+            raise _ParseStall("parser stopped making progress")
+        return self._tokens[self._i]
 
     def _advance(self):
         t = self._peek()
         self._i += 1
+        self._stall = 0
         return t
 
     def _peek_is(self, kind, value):
@@ -522,7 +540,8 @@ class UsdFile:
             custom = False
             while self._peek() is not None and self._peek().kind == "ident" and \
                     self._peek().value in ("custom", "uniform"):
-                custom = custom or self._advance().value == "custom"
+                mod = self._advance()      # consume EVERY modifier token
+                custom = custom or mod.value == "custom"
             _ = custom
 
             type_tok = self._advance()
@@ -872,6 +891,23 @@ def matrix4d_rows(v):
     return [nums[i * 4:i * 4 + 4] for i in range(4)]
 
 
+def _has_xform(prim: Prim) -> bool:
+    """True if the prim carries any transform-op attributes.
+
+    CUE4Parse writes a NESTED component hierarchy: actor scope -> root
+    component (its own xformOps) -> child components (xformOps relative to
+    the parent).  glTF nodes compose parent*child, so every prim in the
+    chain must keep its matrix or children collapse to wrong positions
+    (this is what bunched all child meshes near the origin)."""
+    if prim.get("xformOpOrder") is not None:
+        return True
+    for name in prim.attrs:
+        if isinstance(name, str) and name.endswith(
+                (":translate", ":orient", ":scale", ":transform")):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # GLB writer
 # ---------------------------------------------------------------------------
@@ -1213,7 +1249,15 @@ class Stage:
                 size = 0
             step("parsing layer %s (%s)" % (rp.name, hsize(size)))
             t0 = time.perf_counter()
-            f = UsdFile(rp)
+            try:
+                f = UsdFile(rp)
+            except _ParseStall:
+                warn("parser stalled on %s - layer SKIPPED (bug guard)"
+                     % _display(rp))
+                return None
+            except RecursionError:
+                warn("layer nests too deeply - skipped: %s" % _display(rp))
+                return None
             self.cache[rp] = f
             log("  layer %s: %s prims, %s, %.2fs"
                 % (rp.name, fmat(f.prim_count), hsize(size),
@@ -1765,7 +1809,11 @@ class SceneBuilder:
         children = []
         for child in prim.children:
             self.walk(child, file, children, depth + 1)
-        node_idx = self.glb.add_node(prim.name, children=children or None)
+        # generic prims (actor scopes, root components, nested xforms) keep
+        # their own transform so the glTF node chain composes correctly
+        node_idx = self.glb.add_node(
+            prim.name, children=children or None,
+            matrix=prim_matrix(prim) if _has_xform(prim) else None)
         parent_children.append(node_idx)
         self.stats["nodes"] += 1
 
@@ -1793,7 +1841,8 @@ class SceneBuilder:
             if children:
                 # apply the level-reference transform (usually identity)
                 node_idx = self.glb.add_node(
-                    prim.name, children=children, matrix=prim_matrix(prim))
+                    prim.name, children=children,
+                    matrix=prim_matrix(prim) if _has_xform(prim) else None)
                 parent_children.append(node_idx)
                 self.stats["nodes"] += 1
             return
@@ -1802,8 +1851,10 @@ class SceneBuilder:
         mesh_idx = self._gltf_mesh(geo, target, prim, file, target.name)
         if mesh_idx is None:
             return
-        node_idx = self.glb.add_node(prim.name, matrix=prim_matrix(prim),
-                                     mesh=mesh_idx)
+        node_idx = self.glb.add_node(
+            prim.name,
+            matrix=prim_matrix(prim) if _has_xform(prim) else None,
+            mesh=mesh_idx)
         parent_children.append(node_idx)
         self.stats["mesh_instances"] += 1
         self.stats["nodes"] += 1
@@ -1893,7 +1944,10 @@ class SceneBuilder:
             inst_children.append(len(self.glb.nodes) - 1)
             self.stats["instanced_points"] += 1
 
-        node_idx = self.glb.add_node(prim.name, children=inst_children or None)
+        # the instancer prim itself is a component with its own transform
+        node_idx = self.glb.add_node(
+            prim.name, children=inst_children or None,
+            matrix=prim_matrix(prim) if _has_xform(prim) else None)
         parent_children.append(node_idx)
         self.stats["nodes"] += 1
 
@@ -2034,6 +2088,9 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
 
     step("composing world stage")
     stage = Stage(world_file)
+    if stage.root_file is None:
+        warn("world stage failed to parse - skipping this map")
+        return {"map": map_name, "ok": False, "error": "world stage unparsable"}
     log("stage composed: %d layer(s) in %.1fs"
         % (len(stage.cache), time.perf_counter() - t_start))
 
@@ -2065,6 +2122,10 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
         % (time.perf_counter() - t_start, fmat(st["nodes"]),
            fmat(st["unique_meshes"]), fmat(st["mesh_instances"]),
            fmat(st["instanced_points"]), fmat(st["triangles"])))
+    if st["unresolved"]:
+        log("  NOTE: %s prim(s) had unresolved mesh references - that "
+            "geometry is missing from the .glb (details in warnings)"
+            % fmat(st["unresolved"]))
 
     # the root node carries the whole stage->glTF space conversion
     root_idx = glb.add_node(map_name, children=children or None,
@@ -2139,12 +2200,19 @@ def main(argv=None) -> int:
     script_dir = _win_abs(Path(__file__).resolve().parent)
 
     if args.map:
-        target = Path(args.map)
-        if not target.is_absolute():
-            target = script_dir / target
-        map_dirs = [_win_abs(target)]
+        # explicit paths resolve against the CURRENT directory (standard CLI
+        # behaviour) - not against wherever build_map.py happens to sit
+        map_dirs = [_norm_path(os.path.abspath(str(args.map)))]
     else:
-        map_dirs = find_map_dirs(script_dir)
+        # no argument: prefer the current directory, then the script's own
+        # folder (covers the double-click / run-next-to-Maps flow)
+        try:
+            cwd = Path.cwd()
+        except OSError:
+            cwd = script_dir
+        map_dirs = find_map_dirs(cwd)
+        if not map_dirs and cwd != script_dir:
+            map_dirs = find_map_dirs(script_dir)
 
     if args.list:
         for m in map_dirs:
