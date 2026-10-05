@@ -310,34 +310,32 @@ public sealed class ArchiveService
 
     private static void WriteBlenderHelper(string mapOut)
     {
-        // Import ONLY the top-level world stage. Its USD subLayers/references pull in
-        // the streaming levels and mesh assets. Importing every .usda recursively
-        // duplicates the entire scene and can exhaust Blender's RAM.
+        // Import only the top-level world stage. USD subLayers/references bring in
+        // streaming levels and assets; importing every asset USD separately duplicates
+        // the scene in Blender and can exhaust RAM.
         var worldFile = Directory.EnumerateFiles(mapOut, "*.usda", SearchOption.TopDirectoryOnly)
             .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
-        var script = $"""
-import bpy
-from pathlib import Path
+        var worldLiteral = (worldFile ?? string.Empty)
+            .Replace("\\", "/")
+            .Replace("\"", "\\\"");
 
-ROOT = Path(__file__).resolve().parent
-WORLD = Path(r"{worldFile ?? ""}")
+        var script =
+            "import bpy\n" +
+            "from pathlib import Path\n\n" +
+            "ROOT = Path(__file__).resolve().parent\n" +
+            "WORLD = Path(\"" + worldLiteral + "\")\n\n" +
+            "if not WORLD.exists():\n" +
+            "    raise FileNotFoundError(f\"World USD not found: {WORLD}\")\n\n" +
+            "print(\"SessionMapExporter: importing persistent world:\", WORLD)\n" +
+            "bpy.ops.wm.usd_import(filepath=str(WORLD))\n\n" +
+            "# Game lighting is intentionally excluded from the exported stage.\n" +
+            "for obj in list(bpy.data.objects):\n" +
+            "    if obj.type == 'LIGHT':\n" +
+            "        bpy.data.objects.remove(obj, do_unlink=True)\n\n" +
+            "print(\"SessionMapExporter: world import complete.\")\n";
 
-if not WORLD.exists():
-    raise FileNotFoundError(f"World USD not found: {{WORLD}}")
-
-print("SessionMapExporter: importing persistent world:", WORLD)
-bpy.ops.wm.usd_import(filepath=str(WORLD))
-
-# Game lighting is intentionally not part of the exported stage when that option
-# was enabled. Remove any residual imported light objects defensively.
-for obj in list(bpy.data.objects):
-    if obj.type == 'LIGHT':
-        bpy.data.objects.remove(obj, do_unlink=True)
-
-print("SessionMapExporter: world import complete.")
-""";
         File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), script);
     }
 
