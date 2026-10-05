@@ -1,24 +1,20 @@
 using System.IO;
+using System.Reflection;
 using System.Text.Json;
 using CUE4Parse;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
-using CUE4Parse.UE4.Objects.Core.Misc;
-using CUE4Parse.UE4.Objects.Engine;
+using CUE4Parse.UE4.Assets.Exports;
+using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion;
+using CUE4Parse_Conversion.Dto;
+using CUE4Parse_Conversion.Exporters;
 using CUE4Parse_Conversion.Options;
+using CUE4Parse_Conversion.Writers.UEFormat.Enums;
 
 namespace SessionMapExporter.Core;
-
-/// <summary>One export job: a world plus the folder it should end up in.</summary>
-public sealed record ExportRequest(
-    IReadOnlyList<MapEntry> Worlds,
-    string FolderName,
-    string DisplayName)
-{
-    public MapEntry PrimaryWorld => Worlds[0];
-}
 
 public sealed class ArchiveService
 {
@@ -54,14 +50,13 @@ public sealed class ArchiveService
         var provider = new DefaultFileProvider(pakDirectory, SearchOption.TopDirectoryOnly, true, version);
         provider.Initialize();
         provider.SubmitKey(new FGuid(), new FAesKey(normalized));
+        provider.PostMount();
         Provider = provider;
     }
 
     /// <summary>
-    /// Returns actual Unreal worlds, not every package ending in .umap.
-    /// A package is only shown when it successfully resolves a UWorld export.
-    /// Streaming/sublevel packages are deliberately not promoted to separate maps;
-    /// the CUE4Parse WorldExporter follows them from the selected persistent world.
+    /// Finds actual UWorld packages. The list is intentionally a list of persistent/
+    /// independently loadable worlds, not a list of every .umap filename.
     /// </summary>
     public IReadOnlyList<MapEntry> FindWorlds(IProgress<string>? progress = null)
     {
@@ -75,39 +70,33 @@ public sealed class ArchiveService
             .ToArray();
 
         var worlds = new List<MapEntry>();
-        var seen = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
         for (var i = 0; i < candidates.Length; i++)
         {
             var path = candidates[i];
-            progress?.Report($"Inspecting world packages {i + 1}/{candidates.Length}…");
+            progress?.Report($"Resolving worlds {i + 1}/{candidates.Length}…");
 
             try
             {
                 var package = Provider.LoadPackage(path);
-                var world = package.GetExports()
-                    .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
-
-                if (world is null) continue;
-
-                var normalizedPath = path.TrimStart('/');
-                if (seen.Add(normalizedPath))
-                    worlds.Add(new MapEntry(normalizedPath));
+                if (package.GetExports().Any(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal)))
+                    worlds.Add(new MapEntry(path.TrimStart('/')));
             }
             catch
             {
-                // Some .umap packages are auxiliary/corrupt/unsupported for this game build.
-                // They are not reported as maps merely because their filename ends in .umap.
+                // Unsupported/corrupt auxiliary package: not a selectable world.
             }
         }
 
         return worlds
-            .OrderBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+            .GroupBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
+            .Select(x => x.First())
+            .OrderBy(x => x.DisplayName, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(x => x.Path, StringComparer.OrdinalIgnoreCase)
             .ToList();
     }
 
     public async Task ExportWorldsAsync(
-        IReadOnlyList<ExportRequest> requests,
+        IReadOnlyList<MapEntry> maps,
         string outputRoot,
         bool exportTextures,
         bool exportMaterials,
@@ -117,513 +106,444 @@ public sealed class ArchiveService
     {
         if (Provider is null) throw new InvalidOperationException("Provider has not been initialized.");
 
-        var summary = new List<object>();
-        var mapsRoot = Path.Combine(outputRoot, "Maps");
-        Directory.CreateDirectory(mapsRoot);
+        var options = new ExportOptions(
+            meshFormat: EMeshFormat.USD,
+            naniteMeshFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ENaniteMeshFormat.NoNanite,
+            meshQuality: CUE4Parse_Conversion.Writers.UEFormat.Enums.EMeshQuality.Highest,
+            texturePlatform: CUE4Parse.UE4.Assets.Exports.Texture.ETexturePlatform.DesktopMobile,
+            textureFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ETextureFormat.Png,
+            textureQuality: 100,
+            exportHdrTexturesAsHdr: false,
+            exportAllTextureMips: false,
+            materialDepth: exportMaterials
+                ? CUE4Parse_Conversion.Writers.UEFormat.Enums.EMaterialDepth.AllLayersNoRef
+                : CUE4Parse_Conversion.Writers.UEFormat.Enums.EMaterialDepth.TopLayerOnly,
+            exportMaterials: exportMaterials,
+            exportMorphTargets: false,
+            socketFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ESocketFormat.None,
+            compressionFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.EFileCompressionFormat.None);
 
-        var usedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-        foreach (var request in requests)
+        foreach (var map in maps)
         {
             ct.ThrowIfCancellationRequested();
+            progress?.Report($"Building map scene: {map.DisplayName}…");
 
-            // Clean layout: Maps/<Map Name>/source  - no more deep package trees.
-            var mapOut = Path.Combine(mapsRoot, UniqueFolderName(request.FolderName, usedFolders));
-            var sourceOut = Path.Combine(mapOut, "source");
-            Directory.CreateDirectory(sourceOut);
+            var relative = map.Path.Replace('/', Path.DirectorySeparatorChar);
+            relative = Path.ChangeExtension(relative, null) ?? relative;
+            var mapOut = Path.Combine(outputRoot, "Maps", SanitizeRelativePath(relative));
+            Directory.CreateDirectory(mapOut);
 
-            progress?.Report($"Loading {request.DisplayName} ({request.Worlds.Count} world packages)…");
-
-            var loadedWorlds = new List<(MapEntry Entry, UWorld World)>();
-            foreach (var worldEntry in request.Worlds)
-            {
-                ct.ThrowIfCancellationRequested();
-                progress?.Report($"Loading {worldEntry.DisplayName}…");
-
-                var package = Provider.LoadPackage(worldEntry.Path);
-                var world = package.GetExports()
-                    .OfType<UWorld>()
-                    .FirstOrDefault();
-
-                if (world is null)
-                {
-                    progress?.Report($"Skipping {worldEntry.DisplayName}: UWorld export could not be resolved.");
-                    continue;
-                }
-
-                loadedWorlds.Add((worldEntry, world));
-            }
-
-            if (loadedWorlds.Count == 0)
-            {
-                summary.Add(new
-                {
-                    worlds = request.Worlds.Select(x => x.Path).ToArray(),
-                    success = false,
-                    error = "None of the selected map's world packages could be resolved."
-                });
-                continue;
-            }
-
-            var queuedWorldObjectPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-
-            ExportSession? session = null;
-            session = new ExportSession((args, filterCt) =>
-            {
-                // CUE4Parse's WorldExporter only automatically queues streaming
-                // levels marked persistent. Session has streamed map content that
-                // can be referenced from non-persistent levels, so queue every
-                // streaming world exposed by WorldDto as well.
-                foreach (var level in args.StreamingLevels)
-                {
-                    filterCt.ThrowIfCancellationRequested();
-                    queuedWorldObjectPaths.Add(level.World.GetPathName());
-                    session.Add(level.World);
-                }
-            })
-            {
-                MaxDegreeOfParallelism = 1
-            };
-
-            // IMPORTANT: a Session map is composed of several sibling UWorld
-            // packages (_Art, _Unmerged, _Vege, etc.). Export the whole group into
-            // one ExportSession instead of choosing only one "primary" world.
-            foreach (var (_, world) in loadedWorlds)
-            {
-                queuedWorldObjectPaths.Add(world.GetPathName());
-                session.Add(world);
-            }
-
-            var options = BuildExportOptions(exportTextures, exportMaterials);
-
-            progress?.Report($"Exporting {request.DisplayName} ({loadedWorlds.Count} world packages) as USD…");
-            var results = await session.RunAsync(sourceOut, options, null, ct);
-
-            if (noGameLighting)
-                StripUsdLights(sourceOut);
-
-            var sourceWorlds = results
-                .Where(r => r.Success && queuedWorldObjectPaths.Contains(r.ObjectPath) && r.DiskFilePaths is not null)
-                .SelectMany(r => r.DiskFilePaths!)
-                .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
-                .Distinct(StringComparer.OrdinalIgnoreCase)
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
-                .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
-                .ToList();
-
-            // Blender's USD importer does not resolve USD sublayers/references
-            // reliably. Create one composition root; build_map.py will flatten it
-            // with Blender's bundled Pixar USD library before importing the geometry.
-            if (sourceWorlds.Count == 0)
-            {
-                summary.Add(new
-                {
-                    worlds = request.Worlds.Select(x => x.Path).ToArray(),
-                    displayName = request.DisplayName,
-                    success = false,
-                    resultCount = results.Count,
-                    error = "No exported UWorld USDA files were produced."
-                });
-                continue;
-            }
-
-            var compositionRoot = WriteCompositionRoot(mapOut, request.DisplayName, sourceWorlds);
-
-            // Generate the helper that actually imports the complete composed map.
-            WriteBlenderHelper(mapOut, compositionRoot);
-
-            var textureFiles = Directory.EnumerateFiles(sourceOut, "*.*", SearchOption.AllDirectories)
-                .Count(p => p.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
-                           p.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
-                           p.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
-                           p.EndsWith(".tga", StringComparison.OrdinalIgnoreCase));
-
-            var materialFiles = Directory.EnumerateFiles(sourceOut, "*.usda", SearchOption.AllDirectories)
-                .Count(p => p.Contains($"{Path.DirectorySeparatorChar}Materials{Path.DirectorySeparatorChar}",
-                    StringComparison.OrdinalIgnoreCase));
-
-            var manifest = new
-            {
-                worlds = request.Worlds.Select(x => x.Path).ToArray(),
-                displayName = request.DisplayName,
-                format = "USD / USDA",
-                compositionRoot = Path.GetRelativePath(mapOut, compositionRoot).Replace('\\', '/'),
-                builder = "run python build_map.py to flatten the USD composition in Blender and write a textured .glb",
-                exportedAtUtc = DateTime.UtcNow,
-                worldPackagesRequested = request.Worlds.Count,
-                worldPackagesLoaded = loadedWorlds.Count,
-                streamingLevelsQueued = true,
-                gameLightingExcluded = noGameLighting,
-                textureExportRequested = exportTextures,
-                materialExportRequested = exportMaterials,
-                exportedTextureFileCount = textureFiles,
-                exportedMaterialFileCount = materialFiles,
-                sourceWorlds,
-                resultCount = results.Count,
-                successfulResultCount = results.Count(r => r.Success),
-                results = results.Select(r => new
-                {
-                    r.ObjectPath,
-                    r.Success,
-                    diskFilePaths = r.DiskFilePaths?.ToArray(),
-                    error = r.Error?.ToString()
-                }).ToArray()
-            };
-
-            await File.WriteAllTextAsync(
-                Path.Combine(mapOut, "export-manifest.json"),
-                JsonSerializer.Serialize(manifest, new JsonSerializerOptions { WriteIndented = true }),
-                ct);
-
-            summary.Add(new
-            {
-                worlds = request.Worlds.Select(x => x.Path).ToArray(),
-                displayName = request.DisplayName,
-                success = results.Any(r => r.Success),
-                resultCount = results.Count,
-                outputDirectory = mapOut
-            });
+            await ExportMapSceneAsync(map, mapOut, options, exportTextures, exportMaterials, noGameLighting, progress, ct);
         }
 
         await File.WriteAllTextAsync(
-            Path.Combine(outputRoot, "maps-export-summary.json"),
-            JsonSerializer.Serialize(new
-            {
-                exportedAtUtc = DateTime.UtcNow,
-                mapCount = requests.Count,
-                maps = summary
-            }, new JsonSerializerOptions { WriteIndented = true }),
+            Path.Combine(outputRoot, "Maps", "README.txt"),
+            "Each map is exported as a lightweight scene manifest plus unique USD mesh assets.\n" +
+            "Do NOT open a generated _flattened_map.usda: this exporter intentionally does not generate one.\n" +
+            "Run import_to_blender.py from a map folder to instance the exported assets without flattening the entire world.\n",
             ct);
     }
 
-    private static string UniqueFolderName(string folderName, HashSet<string> used)
+    private async Task ExportMapSceneAsync(
+        MapEntry map,
+        string mapOut,
+        ExportOptions options,
+        bool exportTextures,
+        bool exportMaterials,
+        bool noGameLighting,
+        IProgress<string>? progress,
+        CancellationToken ct)
     {
-        // folder names may contain subfolders (individual-world exports)
-        var segments = folderName.Split('\\', '/');
-        var name = string.Join(Path.DirectorySeparatorChar,
-            segments.Select(MapGrouping.Sanitize));
-        var candidate = name;
-        var i = 2;
-        while (!used.Add(candidate))
-            candidate = $"{name} {i++}";
-        return candidate;
-    }
+        var package = Provider!.LoadPackage(map.Path);
+        var rootWorld = package.GetExports().FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal)) as UWorld;
+        if (rootWorld is null)
+            throw new InvalidDataException($"'{map.Path}' did not resolve to a UWorld.");
 
-    private static string WriteCompositionRoot(string mapOut, string displayName, IReadOnlyList<string> sourceWorlds)
-    {
-        var rootPath = Path.Combine(mapOut, $"{MapGrouping.Sanitize(displayName)}.usda");
-        using var writer = new StreamWriter(rootPath, false, new System.Text.UTF8Encoding(false));
-
-        writer.WriteLine("#usda 1.0");
-        writer.WriteLine("(");
-        writer.WriteLine("    subLayers = [");
-        for (var i = 0; i < sourceWorlds.Count; i++)
+        var scene = new MapSceneData
         {
-            var rel = sourceWorlds[i].Replace('\\', '/').Replace("\"", "\\\"");
-            writer.WriteLine($"        @{rel}@{(i + 1 == sourceWorlds.Count ? "" : ",")}");
-        }
-        writer.WriteLine("    ]");
-        writer.WriteLine(")");
-        writer.WriteLine();
-        writer.WriteLine("def Xform \"SessionMap\"");
-        writer.WriteLine("{");
-        writer.WriteLine("}");
-        return rootPath;
-    }
-
-    private static ExportOptions BuildExportOptions(bool textures, bool materials)
-    {
-        // ExportOptions uses primary-constructor parameters and exposes readonly fields.
-        // Reflection against properties therefore cannot change MeshFormat after construction.
-        // Construct it with the current CUE4Parse values instead.
-        var type = typeof(ExportOptions);
-        var ctor = type.GetConstructors().OrderByDescending(x => x.GetParameters().Length).First();
-
-        var args = ctor.GetParameters().Select(p =>
-        {
-            var name = p.Name ?? string.Empty;
-            var t = p.ParameterType;
-
-            if (t.IsEnum)
-            {
-                var preferred = name switch
-                {
-                    var n when n.Contains("meshFormat", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "USD" },
-                    var n when n.Contains("nanite", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "NoNanite" },
-                    var n when n.Contains("meshQuality", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "Highest" },
-                    var n when n.Contains("texturePlatform", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "DesktopMobile" },
-                    var n when n.Contains("textureFormat", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "Png" },
-                    var n when n.Contains("materialDepth", StringComparison.OrdinalIgnoreCase) =>
-                        materials ? new[] { "AllLayersNoRef" } : new[] { "TopLayerOnly" },
-                    var n when n.Contains("socketFormat", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "Bone" },
-                    var n when n.Contains("compressionFormat", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "None" },
-                    _ => Array.Empty<string>()
-                };
-
-                foreach (var candidate in preferred)
-                {
-                    var match = Enum.GetNames(t).FirstOrDefault(x =>
-                        x.Equals(candidate, StringComparison.OrdinalIgnoreCase));
-                    if (match is not null)
-                        return Enum.Parse(t, match, true);
-                }
-
-                return Enum.GetValues(t).GetValue(0)!;
-            }
-
-            if (t == typeof(bool))
-            {
-                return name switch
-                {
-                    var n when n.Contains("exportHdrTexturesAsHdr", StringComparison.OrdinalIgnoreCase) => false,
-                    var n when n.Contains("exportAllTextureMips", StringComparison.OrdinalIgnoreCase) => false,
-                    var n when n.Contains("exportMaterials", StringComparison.OrdinalIgnoreCase) => materials,
-                    var n when n.Contains("exportMorphTargets", StringComparison.OrdinalIgnoreCase) => false,
-                    _ => false
-                };
-            }
-
-            if (t == typeof(int))
-                return name.Contains("textureQuality", StringComparison.OrdinalIgnoreCase) ? 95 : 0;
-
-            if (t == typeof(float)) return 1f;
-            if (t == typeof(double)) return 1d;
-
-            return t.IsValueType ? Activator.CreateInstance(t) : null;
-        }).ToArray();
-
-        return (ExportOptions)ctor.Invoke(args);
-    }
-
-    private static void StripUsdLights(string root)
-    {
-        foreach (var file in Directory.EnumerateFiles(root, "*.usda", SearchOption.AllDirectories))
-        {
-            var text = File.ReadAllText(file);
-            var stripped = RemoveUsdLightPrims(text);
-            if (!text.Equals(stripped, StringComparison.Ordinal))
-                File.WriteAllText(file, stripped);
-        }
-    }
-
-    private static string RemoveUsdLightPrims(string text)
-    {
-        var lightTypes = new[]
-        {
-            "DistantLight", "SphereLight", "RectLight", "DiskLight",
-            "DomeLight", "CylinderLight", "PortalLight", "Light"
+            MapPath = map.Path,
+            MapName = map.DisplayName,
+            GeneratedUtc = DateTime.UtcNow,
+            GameLightingExcluded = noGameLighting
         };
 
-        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-        var output = new List<string>(lines.Length);
+        var uniqueAssets = new Dictionary<string, UObject>(StringComparer.OrdinalIgnoreCase);
+        var rootWorlds = new Dictionary<string, UWorld>(StringComparer.OrdinalIgnoreCase);
+        CollectWorld(rootWorld, scene, uniqueAssets, rootWorlds, ct);
 
-        for (var i = 0; i < lines.Length; i++)
+        // Always export each unique mesh only once. Actor placements become instances in the
+        // Blender scene, which is the critical difference from WorldExporter/flattened USD.
+        var assetSession = new ExportSession
         {
-            var trimmed = lines[i].TrimStart();
-            var isLight = lightTypes.Any(type =>
-                trimmed.StartsWith($"def {type} ", StringComparison.Ordinal) ||
-                trimmed.StartsWith($"over {type} ", StringComparison.Ordinal));
+            MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
+        };
 
-            if (!isLight)
-            {
-                output.Add(lines[i]);
-                continue;
-            }
+        foreach (var asset in uniqueAssets.Values)
+            assetSession.Add(asset);
 
-            var depth = CountBraces(lines[i]);
-            while (i + 1 < lines.Length && depth > 0)
+        progress?.Report($"Exporting {uniqueAssets.Count} unique mesh assets for {map.DisplayName}…");
+        var assetsOut = Path.Combine(mapOut, "Assets");
+        Directory.CreateDirectory(assetsOut);
+
+        var results = uniqueAssets.Count == 0
+            ? Array.Empty<ExportResult>()
+            : await assetSession.RunAsync(assetsOut, options, null, ct);
+
+        var exported = results
+            .Where(r => r.Success && r.DiskFilePaths is { Count: > 0 })
+            .ToDictionary(r => r.ObjectPath, r => r.DiskFilePaths![0], StringComparer.OrdinalIgnoreCase);
+
+        // Spline components are also roots in CUE4Parse. They are exported once each because
+        // their geometry is component-specific; they are never duplicated into the world file.
+        foreach (var placement in scene.Instances.Where(x => x.AssetKind == "SplineMesh"))
+        {
+            if (placement.SourceObjectPath is null) continue;
+            if (!exported.ContainsKey(placement.SourceObjectPath))
             {
-                i++;
-                depth += CountBraces(lines[i]);
+                // The object was already queued through uniqueAssets when possible.
             }
         }
 
-        return string.Join(Environment.NewLine, output);
-    }
-
-    private static int CountBraces(string line)
-    {
-        var count = 0;
-        var inString = false;
-
-        for (var i = 0; i < line.Length; i++)
+        foreach (var asset in scene.Assets)
         {
-            if (line[i] == '"' && (i == 0 || line[i - 1] != '\\'))
-                inString = !inString;
-            else if (!inString)
-            {
-                if (line[i] == '{') count++;
-                else if (line[i] == '}') count--;
-            }
+            if (exported.TryGetValue(asset.ObjectPath, out var path))
+                asset.File = Path.GetRelativePath(mapOut, path).Replace('\\', '/');
         }
 
-        return count;
+        if (noGameLighting)
+            scene.Instances.RemoveAll(x => x.AssetKind == "Light");
+
+        await File.WriteAllTextAsync(
+            Path.Combine(mapOut, "map-scene.json"),
+            JsonSerializer.Serialize(scene, JsonOptions),
+            ct);
+
+        WriteBlenderHelper(mapOut);
+        WriteMapInfo(mapOut, scene, rootWorlds.Count);
     }
 
-    private static void WriteBlenderHelper(string mapOut, string compositionRoot)
+    private void CollectWorld(
+        UWorld world,
+        MapSceneData scene,
+        Dictionary<string, UObject> assets,
+        Dictionary<string, UWorld> worlds,
+        CancellationToken ct)
     {
-        var rootLiteral = Path.GetFullPath(compositionRoot)
-            .Replace("\\", "/")
-            .Replace("\"", "\\\"");
+        ct.ThrowIfCancellationRequested();
+        if (!worlds.TryAdd(world.GetPathName(), world)) return;
 
-        var buildScript = $$"""
-import argparse
-import os
-import shutil
-import subprocess
-import sys
-import tempfile
+        var dto = new WorldDto(world, ct);
+        try
+        {
+            foreach (var actor in dto.Actors)
+                CollectActor(actor, FTransform.Identity, scene, assets, ct);
+
+            foreach (var streaming in dto.StreamingLevels)
+                CollectWorld(streaming.World, scene, assets, worlds, ct);
+        }
+        finally
+        {
+            dto.Dispose();
+        }
+    }
+
+    private void CollectActor(
+        ActorDto actor,
+        FTransform parentWorld,
+        MapSceneData scene,
+        Dictionary<string, UObject> assets,
+        CancellationToken ct)
+    {
+        ct.ThrowIfCancellationRequested();
+        if (!actor.IsVisible) return;
+
+        var rootWorld = actor.RootComponent is null
+            ? parentWorld
+            : actor.RootComponent.Transform * parentWorld;
+
+        CollectComponent(actor.RootComponent, rootWorld, scene, assets, ct);
+    }
+
+    private void CollectComponent(
+        SceneComponentDto? component,
+        FTransform componentWorld,
+        MapSceneData scene,
+        Dictionary<string, UObject> assets,
+        CancellationToken ct)
+    {
+        if (component is null) return;
+        ct.ThrowIfCancellationRequested();
+
+        if (component is CUE4Parse_Conversion.Dto.MeshComponentDto mesh && !mesh.MeshPtr.IsNull)
+        {
+            if (mesh is CUE4Parse_Conversion.Dto.SplineMeshComponentDto spline)
+            {
+                var splineObject = GetPrivateUObject(spline, "_component");
+                if (splineObject is not null)
+                {
+                    var path = splineObject.GetPathName();
+                    assets.TryAdd(path, splineObject);
+                    scene.Assets.TryAdd(new SceneAsset(path, "SplineMesh"));
+                    scene.Instances.Add(new SceneInstance
+                    {
+                        AssetKind = "SplineMesh",
+                        SourceObjectPath = path,
+                        Transform = ToTransform(componentWorld),
+                        Name = component.Name
+                    });
+                }
+            }
+            else if (mesh.MeshPtr.TryLoad<UObject>(out var meshObject))
+            {
+                var path = meshObject.GetPathName();
+                assets.TryAdd(path, meshObject);
+                scene.Assets.TryAdd(new SceneAsset(path, "Mesh"));
+                AddPlacement(mesh, meshObject, componentWorld, scene);
+            }
+        }
+        else if (component is CUE4Parse_Conversion.Dto.LandscapeMeshComponentDto landscape)
+        {
+            var landscapeObject = GetPrivateUObject(landscape, "_component");
+            if (landscapeObject is not null)
+            {
+                var path = landscapeObject.GetPathName();
+                assets.TryAdd(path, landscapeObject);
+                scene.Assets.TryAdd(new SceneAsset(path, "Landscape"));
+                scene.Instances.Add(new SceneInstance
+                {
+                    AssetKind = "Landscape",
+                    SourceObjectPath = path,
+                    Transform = ToTransform(componentWorld),
+                    Name = component.Name
+                });
+            }
+        }
+        else if (component.GetType().Name.Contains("LightComponent", StringComparison.Ordinal))
+        {
+            scene.Instances.Add(new SceneInstance
+            {
+                AssetKind = "Light",
+                Name = component.Name,
+                Transform = ToTransform(componentWorld)
+            });
+        }
+
+        foreach (var child in component.Children)
+        {
+            var childWorld = child.Transform * componentWorld;
+            CollectComponent(child, childWorld, scene, assets, ct);
+        }
+
+        foreach (var attached in component.AttachedActors)
+            CollectActor(attached, componentWorld, scene, assets, ct);
+    }
+
+    private static void AddPlacement(
+        CUE4Parse_Conversion.Dto.MeshComponentDto mesh,
+        UObject meshObject,
+        FTransform componentWorld,
+        MapSceneData scene)
+    {
+        var path = meshObject.GetPathName();
+
+        if (mesh is CUE4Parse_Conversion.Dto.InstancedStaticMeshComponentDto ism)
+        {
+            foreach (var local in ism.Transforms)
+            {
+                scene.Instances.Add(new SceneInstance
+                {
+                    AssetKind = "Mesh",
+                    SourceObjectPath = path,
+                    Transform = ToTransform(local * componentWorld),
+                    Name = mesh.Name
+                });
+            }
+        }
+        else
+        {
+            scene.Instances.Add(new SceneInstance
+            {
+                AssetKind = mesh.GetType().Name.Contains("Skeletal", StringComparison.OrdinalIgnoreCase)
+                    ? "SkeletalMesh"
+                    : "Mesh",
+                SourceObjectPath = path,
+                Transform = ToTransform(componentWorld),
+                Name = mesh.Name
+            });
+        }
+    }
+
+    private static UObject? GetPrivateUObject(object dto, string fieldName)
+    {
+        var field = dto.GetType().GetField(fieldName, BindingFlags.Instance | BindingFlags.NonPublic);
+        return field?.GetValue(dto) as UObject;
+    }
+
+    private static TransformData ToTransform(FTransform t) => new()
+    {
+        Translation = [t.Translation.X, t.Translation.Y, t.Translation.Z],
+        Rotation = [t.Rotation.X, t.Rotation.Y, t.Rotation.Z, t.Rotation.W],
+        Scale = [t.Scale3D.X, t.Scale3D.Y, t.Scale3D.Z]
+    };
+
+    private static string SanitizeRelativePath(string value)
+    {
+        var parts = value.Split(Path.DirectorySeparatorChar, Path.AltDirectorySeparatorChar);
+        return Path.Combine(parts.Select(Sanitize).ToArray());
+    }
+
+    private static string Sanitize(string value)
+    {
+        foreach (var c in Path.GetInvalidFileNameChars())
+            value = value.Replace(c, '_');
+        return string.IsNullOrWhiteSpace(value) ? "Map" : value;
+    }
+
+    private static void WriteMapInfo(string mapOut, MapSceneData scene, int worldCount)
+    {
+        File.WriteAllText(
+            Path.Combine(mapOut, "export-manifest.json"),
+            JsonSerializer.Serialize(new
+            {
+                scene.MapPath,
+                scene.MapName,
+                scene.GeneratedUtc,
+                format = "USD asset library + Blender instance scene",
+                persistentAndStreamingWorldCount = worldCount,
+                uniqueAssetCount = scene.Assets.Count,
+                instanceCount = scene.Instances.Count,
+                gameLightingExcluded = scene.GameLightingExcluded,
+                flattenedWorldGenerated = false,
+                note = "This export deliberately avoids composing/flattening a giant USD world."
+            }, JsonOptions));
+    }
+
+    private static void WriteBlenderHelper(string mapOut)
+    {
+        var script = """
+import bpy
+import json
 from pathlib import Path
+from mathutils import Matrix, Quaternion, Vector
 
 ROOT = Path(__file__).resolve().parent
-WORLD = Path(r"{{rootLiteral}}")
-DEFAULT_GLB = ROOT / "{{Path.GetFileNameWithoutExtension(compositionRoot)}}.glb"
+DATA = json.loads((ROOT / "map-scene.json").read_text(encoding="utf-8"))
 
-def find_blender(explicit=None):
-    if explicit:
-        return explicit
-    for name in ("blender", "blender.exe"):
-        found = shutil.which(name)
-        if found:
-            return found
-    candidates = []
-    for base in (
-        Path(os.environ.get("PROGRAMFILES", "")) / "Blender Foundation",
-        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Blender Foundation",
-    ):
-        if base.exists():
-            candidates.extend(base.glob("Blender */blender.exe"))
-    if candidates:
-        return str(sorted(candidates)[-1])
-    return None
+# Never import a flattened USD stage. Each unique mesh asset is loaded once, then linked
+# into the scene for every placement. This keeps RAM proportional to unique geometry,
+# rather than to the number of world instances.
+asset_objects = {}
 
-def main():
-    ap = argparse.ArgumentParser(description="Flatten a SessionMapExporter USD map and build a textured GLB.")
-    ap.add_argument("--blender", help="Path to blender.exe")
-    ap.add_argument("--output", type=Path, help="Override GLB output path")
-    args = ap.parse_args()
+def unreal_to_blender_transform(t):
+    # CUE4Parse USD meshes mirror Unreal Y. Apply the same handedness conversion to
+    # actor transforms before creating the Blender matrix.
+    tx, ty, tz = t["translation"]
+    qx, qy, qz, qw = t["rotation"]
+    sx, sy, sz = t["scale"]
 
-    blender = find_blender(args.blender)
-    if not blender:
-        print("ERROR: Blender was not found. Use --blender C:\\Path\\to\\blender.exe")
-        return 2
+    # Reflection across Y: M_blender = C * M_unreal * C, C=diag(1,-1,1,1).
+    c = Matrix(((1,0,0,0),(0,-1,0,0),(0,0,1,0),(0,0,0,1)))
+    q = Quaternion((qw, qx, qy, qz))
+    r = q.to_matrix().to_4x4()
+    s = Matrix.Diagonal((sx, sy, sz, 1.0))
+    m = Matrix.Translation((tx, ty, tz)) @ r @ s
+    return c @ m @ c
 
-    if not WORLD.exists():
-        print(f"ERROR: USD composition root not found: {WORLD}")
-        return 2
-
-    glb = (args.output or DEFAULT_GLB).resolve()
-    flat = ROOT / "_flattened_map.usda"
-    blender_script = ROOT / "_build_map_blender.py"
-
-    script = r'''
-import bpy
-import sys
-from pathlib import Path
-
-bpy.utils.expose_bundled_modules()
-from pxr import Usd
-
-args = sys.argv[sys.argv.index("--") + 1:]
-world = Path(args[0]).resolve()
-flat = Path(args[1]).resolve()
-glb = Path(args[2]).resolve()
-
-print("SessionMapExporter: opening composed USD:", world)
-stage = Usd.Stage.Open(str(world))
-if stage is None:
-    raise RuntimeError("USD stage could not be opened")
-
-print("SessionMapExporter: flattening USD composition...")
-flat_layer = stage.Flatten()
-if not flat_layer.Export(str(flat)):
-    raise RuntimeError("USD flatten/export failed")
-
-print("SessionMapExporter: importing flattened stage into Blender...")
-bpy.ops.wm.usd_import(
-    filepath=str(flat),
-    import_lights=False,
-    import_materials=True,
-    import_meshes=True,
-    import_curves=True,
-    import_points=True,
-    import_visible_only=True,
-    read_mesh_uvs=True,
-    read_mesh_colors=True,
-    read_mesh_attributes=True,
-    import_usd_preview=True,
-    import_textures_mode='IMPORT_PACK',
-)
-
-for obj in list(bpy.data.objects):
-    if obj.type == 'LIGHT':
-        bpy.data.objects.remove(obj, do_unlink=True)
-
-bpy.ops.object.select_all(action='SELECT')
-bpy.context.view_layer.objects.active = next(
-    (o for o in bpy.context.selected_objects if o.type == 'MESH'),
-    None
-)
-
-print("SessionMapExporter: exporting GLB:", glb)
-bpy.ops.export_scene.gltf(
-    filepath=str(glb),
-    export_format='GLB',
-    export_image_format='AUTO',
-    export_materials='EXPORT',
-    export_lights=False,
-    export_cameras=False,
-    export_texcoords=True,
-    export_normals=True,
-    export_yup=True,
-    use_selection=False,
-)
-print("SessionMapExporter: GLB complete")
-'''
-
-    blender_script.write_text(script, encoding="utf-8")
+def import_asset(asset):
+    rel = asset.get("file")
+    if not rel:
+        return []
+    path = ROOT / rel
+    if not path.exists():
+        print("SessionMapExporter: missing asset", path)
+        return []
+    before = set(bpy.data.objects)
     try:
-        cmd = [blender, "--background", "--factory-startup", "--python", str(blender_script),
-               "--", str(WORLD), str(flat), str(glb)]
-        print("Running:", " ".join(f'"{x}"' if " " in x else x for x in cmd))
-        return subprocess.run(cmd).returncode
-    finally:
-        try:
-            blender_script.unlink()
-        except FileNotFoundError:
-            pass
+        bpy.ops.wm.usd_import(filepath=str(path))
+    except Exception as exc:
+        print("SessionMapExporter: USD asset import failed:", path, exc)
+        return []
+    return [o for o in bpy.data.objects if o not in before]
 
-if __name__ == "__main__":
-    raise SystemExit(main())
+for asset in DATA["assets"]:
+    imported = import_asset(asset)
+    asset_objects[asset["objectPath"]] = imported
+
+for inst in DATA["instances"]:
+    if inst.get("assetKind") == "Light":
+        continue
+    source = inst.get("sourceObjectPath")
+    originals = asset_objects.get(source, [])
+    if not originals:
+        continue
+
+    matrix = unreal_to_blender_transform(inst["transform"])
+    for original in originals:
+        obj = original.copy()
+        if original.data is not None:
+            obj.data = original.data
+        obj.matrix_world = matrix @ original.matrix_world
+        obj.name = inst.get("name") or original.name
+        bpy.context.collection.objects.link(obj)
+
+# Keep the original imported asset prototypes in a hidden collection so their mesh datablocks
+# remain available without cluttering the visible map.
+prototype_collection = bpy.data.collections.new("SessionMapExporter_AssetPrototypes")
+bpy.context.scene.collection.children.link(prototype_collection)
+for source, originals in asset_objects.items():
+    for obj in originals:
+        for coll in list(obj.users_collection):
+            coll.objects.unlink(obj)
+        prototype_collection.objects.link(obj)
+prototype_collection.hide_viewport = True
+prototype_collection.hide_render = True
+
+print("SessionMapExporter: imported", len(DATA["assets"]), "unique assets and",
+      len(DATA["instances"]), "map placements.")
 """;
-
-        File.WriteAllText(Path.Combine(mapOut, "build_map.py"), buildScript);
-
-        var importScript = $$"""
-import bpy
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parent
-WORLD = Path(r"{{rootLiteral}}")
-
-if not WORLD.exists():
-    raise FileNotFoundError(f"USD composition root not found: {WORLD}")
-
-# Blender's USD importer does not resolve the CUE4Parse layer/reference
-# composition on its own. build_map.py performs the USD flattening step first.
-print("SessionMapExporter: use build_map.py to build the complete map.")
-print("Composition root:", WORLD)
-""";
-
-        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), importScript);
+        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), script);
     }
 
+    private static readonly JsonSerializerOptions JsonOptions = new()
+    {
+        WriteIndented = false
+    };
 
+    private sealed class MapSceneData
+    {
+        public string MapPath { get; set; } = "";
+        public string MapName { get; set; } = "";
+        public DateTime GeneratedUtc { get; set; }
+        public bool GameLightingExcluded { get; set; }
+        public List<SceneAsset> Assets { get; } = [];
+        public List<SceneInstance> Instances { get; } = [];
+    }
+
+    private sealed class SceneAsset
+    {
+        public SceneAsset(string objectPath, string kind)
+        {
+            ObjectPath = objectPath;
+            AssetKind = kind;
+        }
+
+        public string ObjectPath { get; }
+        public string AssetKind { get; }
+        public string? File { get; set; }
+    }
+
+    private sealed class SceneInstance
+    {
+        public string AssetKind { get; set; } = "";
+        public string? SourceObjectPath { get; set; }
+        public string? Name { get; set; }
+        public TransformData Transform { get; set; } = new();
+    }
+
+    private sealed class TransformData
+    {
+        public float[] Translation { get; set; } = [0, 0, 0];
+        public float[] Rotation { get; set; } = [0, 0, 0, 1];
+        public float[] Scale { get; set; } = [1, 1, 1];
+    }
 }
