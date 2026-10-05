@@ -295,7 +295,7 @@ public sealed class ArchiveService
         writer.WriteLine("    subLayers = [");
         for (var i = 0; i < sourceWorlds.Count; i++)
         {
-            var rel = sourceWorlds[i].Replace('\\', '/').Replace(""", "\\"");
+            var rel = sourceWorlds[i].Replace('\\', '/').Replace("\"", "\\\"");
             writer.WriteLine($"        @{rel}@{(i + 1 == sourceWorlds.Count ? "" : ",")}");
         }
         writer.WriteLine("    ]");
