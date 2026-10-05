@@ -114,10 +114,6 @@ public sealed class ArchiveService
         var mapsRoot = Path.Combine(outputRoot, "Maps");
         Directory.CreateDirectory(mapsRoot);
 
-        // one builder script + short readme per export run, next to Maps/
-        WriteBuilderScript(outputRoot);
-        WriteReadme(outputRoot);
-
         var usedFolders = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
         foreach (var request in requests)
@@ -306,6 +302,71 @@ public sealed class ArchiveService
         }).ToArray();
 
         return (ExportOptions)ctor.Invoke(args);
+    }
+
+    private static void StripUsdLights(string root)
+    {
+        foreach (var file in Directory.EnumerateFiles(root, "*.usda", SearchOption.AllDirectories))
+        {
+            var text = File.ReadAllText(file);
+            var stripped = RemoveUsdLightPrims(text);
+            if (!text.Equals(stripped, StringComparison.Ordinal))
+                File.WriteAllText(file, stripped);
+        }
+    }
+
+    private static string RemoveUsdLightPrims(string text)
+    {
+        var lightTypes = new[]
+        {
+            "DistantLight", "SphereLight", "RectLight", "DiskLight",
+            "DomeLight", "CylinderLight", "PortalLight", "Light"
+        };
+
+        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
+        var output = new List<string>(lines.Length);
+
+        for (var i = 0; i < lines.Length; i++)
+        {
+            var trimmed = lines[i].TrimStart();
+            var isLight = lightTypes.Any(type =>
+                trimmed.StartsWith($"def {type} ", StringComparison.Ordinal) ||
+                trimmed.StartsWith($"over {type} ", StringComparison.Ordinal));
+
+            if (!isLight)
+            {
+                output.Add(lines[i]);
+                continue;
+            }
+
+            var depth = CountBraces(lines[i]);
+            while (i + 1 < lines.Length && depth > 0)
+            {
+                i++;
+                depth += CountBraces(lines[i]);
+            }
+        }
+
+        return string.Join(Environment.NewLine, output);
+    }
+
+    private static int CountBraces(string line)
+    {
+        var count = 0;
+        var inString = false;
+
+        for (var i = 0; i < line.Length; i++)
+        {
+            if (line[i] == '"' && (i == 0 || line[i - 1] != '\\'))
+                inString = !inString;
+            else if (!inString)
+            {
+                if (line[i] == '{') count++;
+                else if (line[i] == '}') count--;
+            }
+        }
+
+        return count;
     }
 
     private static void WriteBlenderHelper(string mapOut)
