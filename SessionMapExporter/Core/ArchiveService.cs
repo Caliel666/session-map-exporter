@@ -301,7 +301,7 @@ public sealed class ArchiveService
         writer.WriteLine("    ]");
         writer.WriteLine(")");
         writer.WriteLine();
-        writer.WriteLine("def Xform "SessionMap"");
+        writer.WriteLine("def Xform \"SessionMap\"");
         writer.WriteLine("{");
         writer.WriteLine("}");
         return rootPath;
