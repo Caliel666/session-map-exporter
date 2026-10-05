@@ -6,6 +6,7 @@ using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.Core.Misc;
 using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Versions;
@@ -114,19 +115,19 @@ public sealed class ArchiveService
 
         var options = new ExportOptions(
             meshFormat: EMeshFormat.USD,
-            naniteMeshFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ENaniteMeshFormat.NoNanite,
-            meshQuality: CUE4Parse_Conversion.Writers.UEFormat.Enums.EMeshQuality.Highest,
+            naniteMeshFormat: ENaniteMeshFormat.NoNanite,
+            meshQuality: EMeshQuality.Highest,
             texturePlatform: CUE4Parse.UE4.Assets.Exports.Texture.ETexturePlatform.DesktopMobile,
-            textureFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ETextureFormat.Png,
+            textureFormat: ETextureFormat.Png,
             textureQuality: 100,
             exportHdrTexturesAsHdr: false,
             exportAllTextureMips: false,
             materialDepth: exportMaterials
-                ? CUE4Parse_Conversion.Writers.UEFormat.Enums.EMaterialDepth.AllLayersNoRef
-                : CUE4Parse_Conversion.Writers.UEFormat.Enums.EMaterialDepth.TopLayerOnly,
+                ? EMaterialDepth.AllLayersNoRef
+                : EMaterialDepth.TopLayerOnly,
             exportMaterials: exportMaterials,
             exportMorphTargets: false,
-            socketFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ESocketFormat.None,
+            socketFormat: ESocketFormat.None,
             compressionFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.EFileCompressionFormat.None);
 
         foreach (var request in maps)
