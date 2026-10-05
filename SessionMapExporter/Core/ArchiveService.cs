@@ -443,35 +443,162 @@ public sealed class ArchiveService
         return count;
     }
 
-    private static void WriteBlenderHelper(string mapOut)
+    private static void WriteBlenderHelper(string mapOut, string compositionRoot)
     {
-        // Import only the top-level world stage. USD subLayers/references bring in
-        // streaming levels and assets; importing every asset USD separately duplicates
-        // the scene in Blender and can exhaust RAM.
-        var worldFile = Directory.EnumerateFiles(mapOut, "*.usda", SearchOption.TopDirectoryOnly)
-            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
-            .FirstOrDefault();
-
-        var worldLiteral = (worldFile ?? string.Empty)
+        var rootLiteral = Path.GetFullPath(compositionRoot)
             .Replace("\\", "/")
             .Replace("\"", "\\\"");
 
-        var script =
-            "import bpy\n" +
-            "from pathlib import Path\n\n" +
-            "ROOT = Path(__file__).resolve().parent\n" +
-            "WORLD = Path(\"" + worldLiteral + "\")\n\n" +
-            "if not WORLD.exists():\n" +
-            "    raise FileNotFoundError(f\"World USD not found: {WORLD}\")\n\n" +
-            "print(\"SessionMapExporter: importing persistent world:\", WORLD)\n" +
-            "bpy.ops.wm.usd_import(filepath=str(WORLD))\n\n" +
-            "# Game lighting is intentionally excluded from the exported stage.\n" +
-            "for obj in list(bpy.data.objects):\n" +
-            "    if obj.type == 'LIGHT':\n" +
-            "        bpy.data.objects.remove(obj, do_unlink=True)\n\n" +
-            "print(\"SessionMapExporter: world import complete.\")\n";
+        var buildScript = $$"""
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
-        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), script);
+ROOT = Path(__file__).resolve().parent
+WORLD = Path(r"{{rootLiteral}}")
+DEFAULT_GLB = ROOT / "{{Path.GetFileNameWithoutExtension(compositionRoot)}}.glb"
+
+def find_blender(explicit=None):
+    if explicit:
+        return explicit
+    for name in ("blender", "blender.exe"):
+        found = shutil.which(name)
+        if found:
+            return found
+    candidates = []
+    for base in (
+        Path(os.environ.get("PROGRAMFILES", "")) / "Blender Foundation",
+        Path(os.environ.get("LOCALAPPDATA", "")) / "Programs" / "Blender Foundation",
+    ):
+        if base.exists():
+            candidates.extend(base.glob("Blender */blender.exe"))
+    if candidates:
+        return str(sorted(candidates)[-1])
+    return None
+
+def main():
+    ap = argparse.ArgumentParser(description="Flatten a SessionMapExporter USD map and build a textured GLB.")
+    ap.add_argument("--blender", help="Path to blender.exe")
+    ap.add_argument("--output", type=Path, help="Override GLB output path")
+    args = ap.parse_args()
+
+    blender = find_blender(args.blender)
+    if not blender:
+        print("ERROR: Blender was not found. Use --blender C:\\Path\\to\\blender.exe")
+        return 2
+
+    if not WORLD.exists():
+        print(f"ERROR: USD composition root not found: {WORLD}")
+        return 2
+
+    glb = (args.output or DEFAULT_GLB).resolve()
+    flat = ROOT / "_flattened_map.usda"
+    blender_script = ROOT / "_build_map_blender.py"
+
+    script = r'''
+import bpy
+import sys
+from pathlib import Path
+
+bpy.utils.expose_bundled_modules()
+from pxr import Usd
+
+args = sys.argv[sys.argv.index("--") + 1:]
+world = Path(args[0]).resolve()
+flat = Path(args[1]).resolve()
+glb = Path(args[2]).resolve()
+
+print("SessionMapExporter: opening composed USD:", world)
+stage = Usd.Stage.Open(str(world))
+if stage is None:
+    raise RuntimeError("USD stage could not be opened")
+
+print("SessionMapExporter: flattening USD composition...")
+flat_layer = stage.Flatten()
+if not flat_layer.Export(str(flat)):
+    raise RuntimeError("USD flatten/export failed")
+
+print("SessionMapExporter: importing flattened stage into Blender...")
+bpy.ops.wm.usd_import(
+    filepath=str(flat),
+    import_lights=False,
+    import_materials=True,
+    import_meshes=True,
+    import_curves=True,
+    import_points=True,
+    import_visible_only=True,
+    read_mesh_uvs=True,
+    read_mesh_colors=True,
+    read_mesh_attributes=True,
+    import_usd_preview=True,
+    import_textures_mode='IMPORT_PACK',
+)
+
+for obj in list(bpy.data.objects):
+    if obj.type == 'LIGHT':
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+bpy.ops.object.select_all(action='SELECT')
+bpy.context.view_layer.objects.active = next(
+    (o for o in bpy.context.selected_objects if o.type == 'MESH'),
+    None
+)
+
+print("SessionMapExporter: exporting GLB:", glb)
+bpy.ops.export_scene.gltf(
+    filepath=str(glb),
+    export_format='GLB',
+    export_image_format='AUTO',
+    export_materials='EXPORT',
+    export_lights=False,
+    export_cameras=False,
+    export_texcoords=True,
+    export_normals=True,
+    export_yup=True,
+    use_selection=False,
+)
+print("SessionMapExporter: GLB complete")
+'''
+
+    blender_script.write_text(script, encoding="utf-8")
+    try:
+        cmd = [blender, "--background", "--factory-startup", "--python", str(blender_script),
+               "--", str(WORLD), str(flat), str(glb)]
+        print("Running:", " ".join(f'"{x}"' if " " in x else x for x in cmd))
+        return subprocess.run(cmd).returncode
+    finally:
+        try:
+            blender_script.unlink()
+        except FileNotFoundError:
+            pass
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+""";
+
+        File.WriteAllText(Path.Combine(mapOut, "build_map.py"), buildScript);
+
+        var importScript = $$"""
+import bpy
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent
+WORLD = Path(r"{{rootLiteral}}")
+
+if not WORLD.exists():
+    raise FileNotFoundError(f"USD composition root not found: {WORLD}")
+
+# Blender's USD importer does not resolve the CUE4Parse layer/reference
+# composition on its own. build_map.py performs the USD flattening step first.
+print("SessionMapExporter: use build_map.py to build the complete map.")
+print("Composition root:", WORLD)
+""";
+
+        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), importScript);
     }
 
 
