@@ -11,7 +11,13 @@ using CUE4Parse_Conversion.Options;
 namespace SessionMapExporter.Core;
 
 /// <summary>One export job: a world plus the folder it should end up in.</summary>
-public sealed record ExportRequest(MapEntry World, string FolderName, string DisplayName);
+public sealed record ExportRequest(
+    IReadOnlyList<MapEntry> Worlds,
+    string FolderName,
+    string DisplayName)
+{
+    public MapEntry PrimaryWorld => Worlds[0];
+}
 
 public sealed class ArchiveService
 {
@@ -125,24 +131,46 @@ public sealed class ArchiveService
             var sourceOut = Path.Combine(mapOut, "source");
             Directory.CreateDirectory(sourceOut);
 
-            progress?.Report($"Loading world {request.World.DisplayName}…");
+            progress?.Report($"Loading {request.DisplayName} ({request.Worlds.Count} world packages)…");
 
-            var package = Provider.LoadPackage(request.World.Path);
-            var world = package.GetExports()
-                .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
-
-            if (world is null)
+            var loadedWorlds = new List<(MapEntry Entry, CUE4Parse.UE4.Assets.Exports.UWorld World)>();
+            foreach (var worldEntry in request.Worlds)
             {
-                summary.Add(new { world = request.World.Path, success = false, error = "UWorld export could not be resolved." });
+                ct.ThrowIfCancellationRequested();
+                progress?.Report($"Loading {worldEntry.DisplayName}…");
+
+                var package = Provider.LoadPackage(worldEntry.Path);
+                var world = package.GetExports()
+                    .OfType<CUE4Parse.UE4.Assets.Exports.UWorld>()
+                    .FirstOrDefault();
+
+                if (world is null)
+                {
+                    progress?.Report($"Skipping {worldEntry.DisplayName}: UWorld export could not be resolved.");
+                    continue;
+                }
+
+                loadedWorlds.Add((worldEntry, world));
+            }
+
+            if (loadedWorlds.Count == 0)
+            {
+                summary.Add(new
+                {
+                    worlds = request.Worlds.Select(x => x.Path).ToArray(),
+                    success = false,
+                    error = "None of the selected map's world packages could be resolved."
+                });
                 continue;
             }
 
             ExportSession? session = null;
             session = new ExportSession((args, filterCt) =>
             {
-                // WorldExporter writes streaming-level references, but its built-in
-                // queueing only follows levels marked persistent. Session uses a large
-                // streamed world, so explicitly queue every referenced streaming world.
+                // CUE4Parse's WorldExporter only automatically queues streaming
+                // levels marked persistent. Session has streamed map content that
+                // can be referenced from non-persistent levels, so queue every
+                // streaming world exposed by WorldDto as well.
                 foreach (var level in args.StreamingLevels)
                 {
                     filterCt.ThrowIfCancellationRequested();
@@ -153,35 +181,59 @@ public sealed class ArchiveService
                 MaxDegreeOfParallelism = 1
             };
 
-            session.Add(world);
+            // IMPORTANT: a Session map is composed of several sibling UWorld
+            // packages (_Art, _Unmerged, _Vege, etc.). Export the whole group into
+            // one ExportSession instead of choosing only one "primary" world.
+            foreach (var (_, world) in loadedWorlds)
+                session.Add(world);
+
             var options = BuildExportOptions(exportTextures, exportMaterials);
 
-            progress?.Report($"Exporting {request.DisplayName} as USD…");
+            progress?.Report($"Exporting {request.DisplayName} ({loadedWorlds.Count} world packages) as USD…");
             var results = await session.RunAsync(sourceOut, options, null, ct);
 
             if (noGameLighting)
                 StripUsdLights(sourceOut);
 
-            var sourceWorlds = results
-                .Where(r => r.Success && r.DiskFilePaths is not null)
-                .SelectMany(r => r.DiskFilePaths!)
-                .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
-                .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
+            var sourceWorlds = Directory.EnumerateFiles(sourceOut, "*.usda", SearchOption.TopDirectoryOnly)
                 .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
                 .ToList();
+
+            // Blender's USD importer does not resolve USD sublayers/references
+            // reliably. Create one composition root; build_map.py will flatten it
+            // with Blender's bundled Pixar USD library before importing the geometry.
+            var compositionRoot = WriteCompositionRoot(mapOut, request.DisplayName, sourceWorlds);
+
+            // Generate the helper that actually imports the complete composed map.
+            WriteBlenderHelper(mapOut, compositionRoot);
+
+            var textureFiles = Directory.EnumerateFiles(sourceOut, "*.*", SearchOption.AllDirectories)
+                .Count(p => p.EndsWith(".png", StringComparison.OrdinalIgnoreCase) ||
+                           p.EndsWith(".jpg", StringComparison.OrdinalIgnoreCase) ||
+                           p.EndsWith(".jpeg", StringComparison.OrdinalIgnoreCase) ||
+                           p.EndsWith(".tga", StringComparison.OrdinalIgnoreCase));
+
+            var materialFiles = Directory.EnumerateFiles(sourceOut, "*.usda", SearchOption.AllDirectories)
+                .Count(p => p.Contains($"{Path.DirectorySeparatorChar}Materials{Path.DirectorySeparatorChar}",
+                    StringComparison.OrdinalIgnoreCase));
 
             var manifest = new
             {
-                map = request.World.Path,
+                worlds = request.Worlds.Select(x => x.Path).ToArray(),
                 displayName = request.DisplayName,
                 format = "USD / USDA",
-                builder = "run  python build_map.py  (see README.txt)  to produce the .glb",
+                compositionRoot = Path.GetRelativePath(mapOut, compositionRoot).Replace('\\', '/'),
+                builder = "run python build_map.py to flatten the USD composition in Blender and write a textured .glb",
                 exportedAtUtc = DateTime.UtcNow,
-                persistentWorldOnly = true,
-                streamingLevelsConsolidatedByWorldExporter = true,
+                worldPackagesRequested = request.Worlds.Count,
+                worldPackagesLoaded = loadedWorlds.Count,
+                streamingLevelsQueued = true,
                 gameLightingExcluded = noGameLighting,
                 textureExportRequested = exportTextures,
                 materialExportRequested = exportMaterials,
+                exportedTextureFileCount = textureFiles,
+                exportedMaterialFileCount = materialFiles,
                 sourceWorlds,
                 resultCount = results.Count,
                 successfulResultCount = results.Count(r => r.Success),
@@ -201,7 +253,7 @@ public sealed class ArchiveService
 
             summary.Add(new
             {
-                world = request.World.Path,
+                worlds = request.Worlds.Select(x => x.Path).ToArray(),
                 displayName = request.DisplayName,
                 success = results.Any(r => r.Success),
                 resultCount = results.Count,
@@ -233,6 +285,28 @@ public sealed class ArchiveService
         return candidate;
     }
 
+    private static string WriteCompositionRoot(string mapOut, string displayName, IReadOnlyList<string> sourceWorlds)
+    {
+        var rootPath = Path.Combine(mapOut, $"{MapGrouping.Sanitize(displayName)}.usda");
+        using var writer = new StreamWriter(rootPath, false, new System.Text.UTF8Encoding(false));
+
+        writer.WriteLine("#usda 1.0");
+        writer.WriteLine("(");
+        writer.WriteLine("    subLayers = [");
+        for (var i = 0; i < sourceWorlds.Count; i++)
+        {
+            var rel = sourceWorlds[i].Replace('\\', '/').Replace(""", "\\"");
+            writer.WriteLine($"        @{rel}@{(i + 1 == sourceWorlds.Count ? "" : ",")}");
+        }
+        writer.WriteLine("    ]");
+        writer.WriteLine(")");
+        writer.WriteLine();
+        writer.WriteLine("def Xform "SessionMap"");
+        writer.WriteLine("{");
+        writer.WriteLine("}");
+        return rootPath;
+    }
+
     private static ExportOptions BuildExportOptions(bool textures, bool materials)
     {
         // ExportOptions uses primary-constructor parameters and exposes readonly fields.
@@ -255,7 +329,7 @@ public sealed class ArchiveService
                     var n when n.Contains("nanite", StringComparison.OrdinalIgnoreCase) =>
                         new[] { "NoNanite" },
                     var n when n.Contains("meshQuality", StringComparison.OrdinalIgnoreCase) =>
-                        new[] { "Lowest" },
+                        new[] { "Highest" },
                     var n when n.Contains("texturePlatform", StringComparison.OrdinalIgnoreCase) =>
                         new[] { "DesktopMobile" },
                     var n when n.Contains("textureFormat", StringComparison.OrdinalIgnoreCase) =>
