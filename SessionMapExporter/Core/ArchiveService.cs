@@ -293,7 +293,7 @@ public sealed class ArchiveService
                     });
                 }
             }
-            else if (mesh.MeshPtr.TryLoad<UObject>(out var meshObject))
+            else if ((mesh.MeshPtr.Load<UObject>() is { } meshObject))
             {
                 var path = meshObject.GetPathName();
                 assets.TryAdd(path, meshObject);
