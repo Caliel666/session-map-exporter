@@ -273,6 +273,8 @@ public sealed class ArchiveService
     {
         if (component is null) return;
         ct.ThrowIfCancellationRequested();
+        if (component is CUE4Parse_Conversion.Dto.PrimitiveComponentDto primitive && !primitive.IsVisible)
+            return;
 
         if (component is CUE4Parse_Conversion.Dto.MeshComponentDto mesh && !mesh.MeshPtr.IsNull)
         {
