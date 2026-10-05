@@ -6,6 +6,7 @@ using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Assets.Exports;
 using CUE4Parse.UE4.Objects.Core.Math;
+using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Objects.UObject;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion;
@@ -15,6 +16,11 @@ using CUE4Parse_Conversion.Options;
 using CUE4Parse_Conversion.Writers.UEFormat.Enums;
 
 namespace SessionMapExporter.Core;
+
+public sealed record ExportRequest(
+    IReadOnlyList<MapEntry> Worlds,
+    string FolderName,
+    string DisplayName);
 
 public sealed class ArchiveService
 {
@@ -96,7 +102,7 @@ public sealed class ArchiveService
     }
 
     public async Task ExportWorldsAsync(
-        IReadOnlyList<MapEntry> maps,
+        IReadOnlyList<ExportRequest> maps,
         string outputRoot,
         bool exportTextures,
         bool exportMaterials,
@@ -123,17 +129,15 @@ public sealed class ArchiveService
             socketFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.ESocketFormat.None,
             compressionFormat: CUE4Parse_Conversion.Writers.UEFormat.Enums.EFileCompressionFormat.None);
 
-        foreach (var map in maps)
+        foreach (var request in maps)
         {
             ct.ThrowIfCancellationRequested();
-            progress?.Report($"Building map scene: {map.DisplayName}…");
+            progress?.Report($"Building map scene: {request.DisplayName}…");
 
-            var relative = map.Path.Replace('/', Path.DirectorySeparatorChar);
-            relative = Path.ChangeExtension(relative, null) ?? relative;
-            var mapOut = Path.Combine(outputRoot, "Maps", SanitizeRelativePath(relative));
+            var mapOut = Path.Combine(outputRoot, "Maps", SanitizeRelativePath(request.FolderName));
             Directory.CreateDirectory(mapOut);
 
-            await ExportMapSceneAsync(map, mapOut, options, exportTextures, exportMaterials, noGameLighting, progress, ct);
+            await ExportMapSceneAsync(request, mapOut, options, exportTextures, exportMaterials, noGameLighting, progress, ct);
         }
 
         await File.WriteAllTextAsync(
@@ -145,7 +149,7 @@ public sealed class ArchiveService
     }
 
     private async Task ExportMapSceneAsync(
-        MapEntry map,
+        ExportRequest request,
         string mapOut,
         ExportOptions options,
         bool exportTextures,
@@ -154,22 +158,31 @@ public sealed class ArchiveService
         IProgress<string>? progress,
         CancellationToken ct)
     {
-        var package = Provider!.LoadPackage(map.Path);
-        var rootWorld = package.GetExports().FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal)) as UWorld;
-        if (rootWorld is null)
-            throw new InvalidDataException($"'{map.Path}' did not resolve to a UWorld.");
+        if (request.Worlds.Count == 0)
+            throw new InvalidDataException($"Map '{request.DisplayName}' contains no worlds.");
+
+        var rootWorldsToCollect = new List<UWorld>();
+        foreach (var map in request.Worlds)
+        {
+            var package = Provider!.LoadPackage(map.Path);
+            if (package.GetExports().FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal)) is UWorld world)
+                rootWorldsToCollect.Add(world);
+        }
+        if (rootWorldsToCollect.Count == 0)
+            throw new InvalidDataException($"'{request.DisplayName}' did not resolve to any UWorld.");
 
         var scene = new MapSceneData
         {
-            MapPath = map.Path,
-            MapName = map.DisplayName,
+            MapPath = request.Worlds[0].Path,
+            MapName = request.DisplayName,
             GeneratedUtc = DateTime.UtcNow,
             GameLightingExcluded = noGameLighting
         };
 
         var uniqueAssets = new Dictionary<string, UObject>(StringComparer.OrdinalIgnoreCase);
         var rootWorlds = new Dictionary<string, UWorld>(StringComparer.OrdinalIgnoreCase);
-        CollectWorld(rootWorld, scene, uniqueAssets, rootWorlds, ct);
+        foreach (var rootWorld in rootWorldsToCollect)
+            CollectWorld(rootWorld, scene, uniqueAssets, rootWorlds, ct);
 
         // Always export each unique mesh only once. Actor placements become instances in the
         // Blender scene, which is the critical difference from WorldExporter/flattened USD.
