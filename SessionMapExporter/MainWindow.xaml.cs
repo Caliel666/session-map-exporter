@@ -189,7 +189,7 @@ public partial class MainWindow : Window
             var outPath = Path.GetFullPath(output);
             StatusText.Text = $"Finished exporting {requests.Count} map(s) to {outPath}. Run 'python build_map.py' inside a map folder to build the complete GLB with Blender.";
             System.Windows.MessageBox.Show(
-                $"Export complete.\n\nOutput: {outPath}\n\nNext step:\n  1. Open a terminal in the exported map folder.\n  2. Run:  python build_map.py\n  3. Import the generated .glb into Blender.\n\nThe exporter included all worlds in the selected map group.";
+                $"Export complete.\n\nOutput: {outPath}\n\nNext step:\n  1. Open a terminal in the exported map folder.\n  2. Run:  python build_map.py\n  3. Import the generated .glb into Blender.\n\nThe exporter included all worlds in the selected map group.",
                 "Session Map Exporter",
                 MessageBoxButton.OK, MessageBoxImage.Information);
         }
