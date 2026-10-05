@@ -27,9 +27,13 @@ public sealed record MapGroup
 
     /// <summary>
     /// Chooses the most likely "real" map inside a group:
-    /// exact folder-name match, then …_P (Unreal persistent level),
-    /// then …_Unmerged, then a name that ends with the folder name,
-    /// then the shortest name (fewest auxiliary suffixes), then alphabetical.
+    /// exact folder-name match, then …_P (Unreal persistent level), then a
+    /// world that actually owns streaming sublevels (>= 2), then …_Unmerged,
+    /// then a name that ends with the folder name, then the shortest name,
+    /// then alphabetical.
+    /// NOTE: the primary is only used for display and as the first world of an
+    /// export - the exporter exports EVERY world of the group, because the
+    /// full map geometry is spread across all of the _Art sublevel packages.
     /// </summary>
     public static MapEntry SelectPrimary(string key, IReadOnlyList<MapEntry> worlds)
     {
@@ -38,7 +42,7 @@ public sealed record MapGroup
             .Select(w =>
             {
                 var name = System.IO.Path.GetFileNameWithoutExtension(w.Path.Replace('\\', '/'));
-                return (entry: w, name, score: Score(name, folderName));
+                return (entry: w, name, score: Score(w, name, folderName));
             })
             .OrderBy(t => t.score)
             .ThenBy(t => t.name.Length)
@@ -48,14 +52,16 @@ public sealed record MapGroup
         return ranked[0].entry;
     }
 
-    private static int Score(string name, string folderName)
+    private static int Score(MapEntry world, string name, string folderName)
     {
         if (name.Equals(folderName, System.StringComparison.OrdinalIgnoreCase)) return 0;
         if (name.EndsWith("_P", System.StringComparison.OrdinalIgnoreCase)) return 1;
-        if (name.EndsWith("_Unmerged", System.StringComparison.OrdinalIgnoreCase)) return 2;
-        if (name.EndsWith(folderName, System.StringComparison.OrdinalIgnoreCase)) return 3;
-        if (name.Contains(folderName, System.StringComparison.OrdinalIgnoreCase)) return 4;
-        return 5;
+        // a world that streams other levels is the persistent map world
+        if (world.StreamingLevels >= 2) return 2;
+        if (name.EndsWith("_Unmerged", System.StringComparison.OrdinalIgnoreCase)) return 3;
+        if (name.EndsWith(folderName, System.StringComparison.OrdinalIgnoreCase)) return 4;
+        if (name.Contains(folderName, System.StringComparison.OrdinalIgnoreCase)) return 5;
+        return 6;
     }
 }
 

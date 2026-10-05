@@ -10,8 +10,17 @@ using CUE4Parse_Conversion.Options;
 
 namespace SessionMapExporter.Core;
 
-/// <summary>One export job: a world plus the folder it should end up in.</summary>
-public sealed record ExportRequest(MapEntry World, string FolderName, string DisplayName);
+/// <summary>
+/// One export job: a set of worlds (every world package of one map group) plus
+/// the folder they should end up in. A Session map is spread across several
+/// world packages (the persistent world plus streamed _Art sublevels such as
+/// PHL01_FDR_Art_LevelArchitecture / _Props / _Unmerged) - exporting only one
+/// of them produces a fraction of the map, so a request always carries them all.
+/// </summary>
+public sealed record ExportRequest(IReadOnlyList<MapEntry> Worlds, string FolderName, string DisplayName)
+{
+    public MapEntry World => Worlds[0];
+}
 
 public sealed class ArchiveService
 {
@@ -54,7 +63,7 @@ public sealed class ArchiveService
     /// Returns actual Unreal worlds, not every package ending in .umap.
     /// A package is only shown when it successfully resolves a UWorld export.
     /// Streaming/sublevel packages are deliberately not promoted to separate maps;
-    /// the CUE4Parse WorldExporter follows them from the selected persistent world.
+    /// exporting a map exports every world package of its group instead.
     /// </summary>
     public IReadOnlyList<MapEntry> FindWorlds(IProgress<string>? progress = null)
     {
@@ -85,7 +94,7 @@ public sealed class ArchiveService
 
                 var normalizedPath = path.TrimStart('/');
                 if (seen.Add(normalizedPath))
-                    worlds.Add(new MapEntry(normalizedPath));
+                    worlds.Add(new MapEntry(normalizedPath, world.StreamingLevels?.Length ?? 0));
             }
             catch
             {
@@ -129,39 +138,88 @@ public sealed class ArchiveService
             var sourceOut = Path.Combine(mapOut, "source");
             Directory.CreateDirectory(sourceOut);
 
-            progress?.Report($"Loading world {request.World.DisplayName}…");
-
-            var package = Provider.LoadPackage(request.World.Path);
-            var world = package.GetExports()
-                .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
-
-            if (world is null)
-            {
-                summary.Add(new { world = request.World.Path, success = false, error = "UWorld export could not be resolved." });
-                continue;
-            }
+            progress?.Report($"Loading {request.Worlds.Count} world package(s) of {request.DisplayName}…");
 
             var session = new ExportSession
             {
                 MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
             };
 
-            session.Add(world);
+            var worldStates = new List<object>();
+            var worldsLoaded = 0;
+            foreach (var entry in request.Worlds)
+            {
+                ct.ThrowIfCancellationRequested();
+                try
+                {
+                    var package = Provider.LoadPackage(entry.Path);
+                    var world = package.GetExports()
+                        .FirstOrDefault(x => x.GetType().Name.Equals("UWorld", StringComparison.Ordinal));
+
+                    if (world is null)
+                    {
+                        worldStates.Add(new { world = entry.Path, loaded = false, error = "UWorld export could not be resolved." });
+                        continue;
+                    }
+
+                    // ExportSession deduplicates by object path, so worlds that
+                    // are also pulled in as streaming levels of the persistent
+                    // world are still exported exactly once.
+                    session.Add(world);
+                    worldsLoaded++;
+                    worldStates.Add(new { world = entry.Path, loaded = true, streamingLevels = entry.StreamingLevels });
+                }
+                catch (Exception ex)
+                {
+                    worldStates.Add(new { world = entry.Path, loaded = false, error = ex.Message });
+                }
+            }
+
+            if (worldsLoaded == 0)
+            {
+                summary.Add(new { world = request.World.Path, success = false, error = "None of the world packages resolved to a UWorld." });
+                continue;
+            }
+
             var options = BuildExportOptions(exportTextures, exportMaterials);
 
-            progress?.Report($"Exporting {request.DisplayName} as USD…");
+            progress?.Report($"Exporting {request.DisplayName} ({worldsLoaded} worlds) as USD…");
             var results = await session.RunAsync(sourceOut, options, null, ct);
 
             if (noGameLighting)
                 StripUsdLights(sourceOut);
 
-            var sourceWorlds = results
-                .Where(r => r.Success && r.DiskFilePaths is not null)
-                .SelectMany(r => r.DiskFilePaths!)
-                .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
-                .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
-                .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+            // List the WORLD STAGE files (one per exported world package) -
+            // build_map.py composes exactly these into the scene. The expected
+            // on-disk path of a world stage is <package path>.usda; if that
+            // check fails for every world we fall back to the .usda files
+            // reported by the export results (old behaviour).
+            var sourceWorlds = request.Worlds
+                .Select(entry =>
+                {
+                    var rel = entry.Path.Replace('\\', '/');
+                    if (rel.EndsWith(".umap", StringComparison.OrdinalIgnoreCase))
+                        rel = rel[..^5];
+                    var candidate = Path.Combine(sourceOut, rel.Replace('/', Path.DirectorySeparatorChar) + ".usda");
+                    return File.Exists(candidate)
+                        ? Path.GetRelativePath(mapOut, candidate).Replace('\\', '/')
+                        : null;
+                })
+                .Where(p => p is not null)
+                .Select(p => p!)
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .ToList();
+
+            if (sourceWorlds.Count == 0)
+            {
+                sourceWorlds = results
+                    .Where(r => r.Success && r.DiskFilePaths is not null)
+                    .SelectMany(r => r.DiskFilePaths!)
+                    .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
+                    .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
+                    .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
+                    .ToList();
+            }
 
             var manifest = new
             {
@@ -170,12 +228,15 @@ public sealed class ArchiveService
                 format = "USD / USDA",
                 builder = "run  python build_map.py  (see README.txt)  to produce the .glb",
                 exportedAtUtc = DateTime.UtcNow,
-                persistentWorldOnly = true,
-                streamingLevelsConsolidatedByWorldExporter = true,
+                persistentWorldOnly = false,
+                allWorldsExported = true,
+                worldsRequested = request.Worlds.Count,
+                worldsLoaded,
                 gameLightingExcluded = noGameLighting,
                 textureExportRequested = exportTextures,
                 materialExportRequested = exportMaterials,
                 sourceWorlds,
+                worlds = worldStates,
                 resultCount = results.Count,
                 successfulResultCount = results.Count(r => r.Success),
                 results = results.Select(r => new
@@ -197,6 +258,8 @@ public sealed class ArchiveService
                 world = request.World.Path,
                 displayName = request.DisplayName,
                 success = results.Any(r => r.Success),
+                worldsRequested = request.Worlds.Count,
+                worldsLoaded,
                 resultCount = results.Count,
                 outputDirectory = mapOut
             });
@@ -414,10 +477,18 @@ public sealed class ArchiveService
                 pip install pillow
                 python build_map.py --max-texture-size 2048
 
+            Instanced import (optional, lower RAM in Blender):
+                build_map.py also writes map-scene.json next to the .glb - the
+                raw placement data (every unique asset + its UE transform).
+                With import_to_blender.py (Blender text editor, set MAP_ROOT)
+                you can build a fully instanced scene from it instead of
+                importing the .glb.
+
             Folder layout
             -------------
               Maps/<Map Name>/source/          raw USD export (keep, it is the master copy)
               Maps/<Map Name>/<Map Name>.glb   the model you import into Blender
+              Maps/<Map Name>/map-scene.json   raw placement data (assets + UE transforms)
               Maps/<Map Name>/build-report.json what was built / skipped / missing
               build_map.py                     the converter (safe to copy elsewhere)
             """;

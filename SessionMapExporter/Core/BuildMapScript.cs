@@ -36,13 +36,22 @@ Requirements
 
 What it does
 ------------
-* Composes the world stage: streaming sublevels (subLayers), world references,
-  mesh references, per-instance material overrides and point instancers.
+* Composes EVERY world stage of the map (persistent world + all streamed
+  _Art sublevels such as ..._LevelArchitecture / _Props / _Unmerged) into one
+  scene - plus subLayers, world references, mesh references, per-instance
+  material overrides and point instancers. Building only the largest stage
+  would drop the rest of the map (missing skatepark/city/props).
 * Instances every unique mesh only once in the file (shared mesh data) - the
-  same static mesh used by 200 actors is stored ONCE, not 200 times.
+  same static mesh used by 200 actors is stored ONCE, not 200 times. Identical
+  baked geometry (spline coping / rail segments exported into different actor
+  folders) is deduplicated by content hash and shares one mesh too.
 * Converts Unreal space to glTF space correctly (metres, +Y up, winding, UVs).
 * Skips game lights, collision/debug shapes and invisible prims.
-* Writes  Maps/<Map>/<Map>.glb  plus a  build-report.json  with statistics.
+* Writes  Maps/<Map>/<Map>.glb  plus:
+    - build-report.json  statistics and warnings
+    - map-scene.json     raw placement data (unique assets + where each one
+      is placed in UE coordinates) - import_to_blender.py builds an instanced
+      Blender scene from it.
 * Streams the .glb to disk (no multi-GB copies in RAM) and logs progress for
   every step, so big maps never look frozen.
 """
@@ -50,6 +59,7 @@ What it does
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -1569,8 +1579,161 @@ class MaterialLibrary:
 # scene walker
 # ---------------------------------------------------------------------------
 
+# safety cap for map-scene.json instances (the .glb itself is never truncated)
+_SCENE_INSTANCE_CAP = 250_000
+
+
+def _mat_ref_id(ref) -> str:
+    """Stable identity of a material reference (file-local path or prim path)."""
+    if ref is None:
+        return "-"
+    kind = ref[0]
+    if kind == "stage":
+        return "s:" + str(ref[1])
+    if kind == "prim":
+        return "p:" + str(getattr(ref[1], "path", "?"))
+    if kind == "file":
+        return "f:" + str(getattr(ref[1], "path", "?")) + "#" + str(ref[2] or "")
+    return str(ref)
+
+
+def _geometry_signature(geo: Geometry, mat_identities) -> str:
+    """Content hash of a Geometry - the dedupe key that collapses identical
+    baked meshes (spline coping segments, rails, repeated actors) that were
+    exported to different actor/component files into ONE shared mesh.
+
+    mat_identities are the RESOLVED material definition identities of the
+    geometry's bindings: identical vertex data bound to different materials
+    must NOT share a mesh, while the same material bound through differently
+    named component prims must."""
+    h = hashlib.md5()
+    for arr in (geo.positions, geo.normals, geo.uvs, geo.colors):
+        if arr is not None:
+            h.update(arr.tobytes())
+        else:
+            h.update(b"\x00none")
+    h.update(b"|i|")
+    h.update(geo.raw_indices.tobytes())
+    h.update(b"|f|")
+    h.update(geo.face_counts.tobytes())
+    subs = geo.subsets if geo.subsets else [(None, None, geo.default_material)]
+    for (name, _faces, _ref), ident in zip(subs, mat_identities):
+        h.update(b"#")
+        h.update((name or "").encode("utf-8", "ignore"))
+        h.update(b"=")
+        h.update(ident.encode("utf-8", "ignore"))
+    h.update(b"|D" if geo.double_sided else b"|d")
+    return h.hexdigest()
+
+
+def mat4_mul(a, b):
+    """Column-major 4x4 matrix product a @ b."""
+    out = [0.0] * 16
+    for col in range(4):
+        b0, b1, b2, b3 = b[col * 4], b[col * 4 + 1], b[col * 4 + 2], b[col * 4 + 3]
+        for row in range(4):
+            out[col * 4 + row] = (a[row] * b0 + a[4 + row] * b1 +
+                                  a[8 + row] * b2 + a[12 + row] * b3)
+    return out
+
+
+def compose_matrix(world, local):
+    """world @ local, treating None as identity."""
+    if world is None:
+        return list(local) if local is not None else None
+    if local is None:
+        return list(world)
+    return mat4_mul(world, local)
+
+
+def conj_y_matrix(m):
+    """C @ m @ C with C = diag(1, -1, 1, 1) (column-major 4x4).
+
+    CUE4Parse mirrors the world across Y when writing USD (points and
+    transforms).  A mirrored placement of mirrored geometry is the original
+    Unreal transform, so conjugating a stage-space matrix with C returns the
+    raw UE-space matrix."""
+    r = list(m)
+    for i in (1, 5, 9, 13):        # C @ m : negate row 1
+        r[i] = -r[i]
+    for i in (4, 5, 6):            # @ C : negate column 1
+        r[i] = -r[i]
+    return r
+
+
+def _matrix_to_quat(m):
+    """Column-major 4x4 (rotation part assumed orthonormal) -> (x, y, z, w)."""
+    # columns
+    c0 = (m[0], m[1], m[2])
+    c1 = (m[4], m[5], m[6])
+    c2 = (m[8], m[9], m[10])
+    # row-major 3x3 for the standard trace method
+    r00, r01, r02 = c0[0], c1[0], c2[0]
+    r10, r11, r12 = c0[1], c1[1], c2[1]
+    r20, r21, r22 = c0[2], c1[2], c2[2]
+    tr = r00 + r11 + r22
+    if tr > 0.0:
+        s = math.sqrt(tr + 1.0) * 2.0
+        w = 0.25 * s
+        x = (r21 - r12) / s
+        y = (r02 - r20) / s
+        z = (r10 - r01) / s
+    elif r00 > r11 and r00 > r22:
+        s = math.sqrt(1.0 + r00 - r11 - r22) * 2.0
+        w = (r21 - r12) / s
+        x = 0.25 * s
+        y = (r01 + r10) / s
+        z = (r02 + r20) / s
+    elif r11 > r22:
+        s = math.sqrt(1.0 + r11 - r00 - r22) * 2.0
+        w = (r02 - r20) / s
+        x = (r01 + r10) / s
+        y = 0.25 * s
+        z = (r12 + r21) / s
+    else:
+        s = math.sqrt(1.0 + r22 - r00 - r11) * 2.0
+        w = (r10 - r01) / s
+        x = (r02 + r20) / s
+        y = (r12 + r21) / s
+        z = 0.25 * s
+    n = math.sqrt(x * x + y * y + z * z + w * w)
+    if n <= 0.0:
+        return (0.0, 0.0, 0.0, 1.0)
+    return (x / n, y / n, z / n, w / n)
+
+
+def usd_matrix_to_ue_transform(m):
+    """Stage-space column-major 4x4 placement -> raw UE transform dict.
+
+    Returns {"translation": [x,y,z] (cm), "rotation": [x,y,z,w],
+             "scale": [x,y,z]} - the schema import_to_blender.py expects."""
+    ue = conj_y_matrix(m)
+    tx, ty, tz = ue[12], ue[13], ue[14]
+    cols = ((ue[0], ue[1], ue[2]),
+            (ue[4], ue[5], ue[6]),
+            (ue[8], ue[9], ue[10]))
+    scale = []
+    for c in cols:
+        s = math.sqrt(c[0] * c[0] + c[1] * c[1] + c[2] * c[2])
+        scale.append(s if s > 1e-9 else 1e-9)
+    rot_cols = tuple(
+        tuple(v / s for v, s in zip(c, scale)) for c, s in zip(cols, scale))
+    # rebuild column-major 4x4 with pure rotation for the quaternion
+    rm = [rot_cols[0][0], rot_cols[0][1], rot_cols[0][2], 0.0,
+          rot_cols[1][0], rot_cols[1][1], rot_cols[1][2], 0.0,
+          rot_cols[2][0], rot_cols[2][1], rot_cols[2][2], 0.0,
+          0.0, 0.0, 0.0, 1.0]
+    qx, qy, qz, qw = _matrix_to_quat(rm)
+    return {
+        "translation": [tx, ty, tz],
+        "rotation": [qx, qy, qz, qw],
+        "scale": [scale[0], scale[1], scale[2]],
+    }
+
+
 class SceneBuilder:
-    def __init__(self, stage: Stage, glb: GLBBuilder, materials: MaterialLibrary):
+    def __init__(self, stage: Stage, glb: GLBBuilder, materials: MaterialLibrary,
+                 skip_files=None, map_dir: Path = None):
         self.stage = stage
         self.glb = glb
         self.materials = materials
@@ -1579,13 +1742,23 @@ class SceneBuilder:
         self.sub_acc_cache = {}  # (geo key, faces) -> index accessor
         self.missing_acc = {}    # geo key -> index accessor for uncovered faces
         self.mesh_cache = {}     # (geo key, material signature) -> glTF mesh
+        self.content_geo = {}    # content hash -> Geometry (cross-file dedupe)
+        self._mat_id_cache = {}  # (file, ref) -> resolved material identity
+        # world stages that are composed as their own scene roots - references
+        # into them from other worlds must NOT be spliced a second time
+        self.skip_files = {str(p) for p in (skip_files or [])}
+        # placement manifest (map-scene.json) - see SceneRecorder below
+        self.map_dir = map_dir
+        self.scene_assets = {}   # asset id -> asset dict
+        self.scene_instances = []
+        self._instances_truncated = False
         self._placed = 0
         self._visited = 0
         self.stats = {
             "nodes": 0, "mesh_instances": 0, "instanced_points": 0,
             "unique_meshes": 0, "empty_meshes": 0, "triangles": 0,
             "skipped_lights": 0, "skipped_shapes": 0, "skipped_invisible": 0,
-            "unresolved": 0,
+            "unresolved": 0, "deduped_geometry": 0, "skipped_level_splice": 0,
         }
 
     # -- reference resolution ------------------------------------------------
@@ -1611,12 +1784,64 @@ class SceneBuilder:
             t0 = time.perf_counter()
             geo = _extract_geometry(mesh_prim, key)
             geo.source_file = file
+            # content-level dedupe: identical geometry that was baked into
+            # DIFFERENT files (deformed spline segments, repeated actors)
+            # shares one Geometry - and therefore one set of GLB accessors.
+            sig = _geometry_signature(geo, self._mat_identities(geo, file))
+            canon = self.content_geo.get(sig)
+            if canon is not None:
+                geo = canon
+                self.stats["deduped_geometry"] += 1
+            else:
+                self.content_geo[sig] = geo
             self.geo_cache[key] = geo
-            if geo.vertex_count >= 100_000:
+            if geo.vertex_count >= 100_000 and canon is None:
                 log("    mesh %s: %s verts, %s tris (%.1fs)"
                     % (mesh_prim.name, fmat(geo.vertex_count),
                        fmat(geo.triangles), time.perf_counter() - t0))
         return geo
+
+    def _mat_identities(self, geo: Geometry, file: UsdFile):
+        """Resolved definition identity for every material binding of geo."""
+        subs = geo.subsets if geo.subsets else [(None, None, geo.default_material)]
+        out = []
+        for _name, _faces, ref in subs:
+            out.append(self._mat_identity(ref, file))
+        return out
+
+    def _mat_identity(self, ref, source_file):
+        """Follows a material reference to its definition and returns a stable
+        '<definition file>|<definition prim path>' identity."""
+        if ref is None:
+            return "-"
+        kind = ref[0]
+        if kind == "stage":
+            f = source_file
+            prim = source_file.by_path.get(ref[1]) if source_file is not None else None
+            cache_key = (str(f.path) if f is not None else "?", str(ref[1]))
+        elif kind == "prim":
+            f, prim = source_file, ref[1]
+            cache_key = (str(f.path) if f is not None else "?",
+                         str(getattr(prim, "path", "?")))
+        else:
+            return _mat_ref_id(ref)
+        got = self._mat_id_cache.get(cache_key)
+        if got is not None:
+            return got
+        hops = 0
+        while prim is not None and prim.references and f is not None and hops < 8:
+            asset, sub = prim.references[0]
+            nf, np_ = self.stage.resolve_reference(f, asset, sub)
+            if np_ is None:
+                break
+            f, prim = nf, np_
+            hops += 1
+        if prim is None:
+            ident = _mat_ref_id(ref)
+        else:
+            ident = "d:%s|%s" % (str(f.path) if f is not None else "?", prim.path)
+        self._mat_id_cache[cache_key] = ident
+        return ident
 
     def _geo_accessors(self, geo: Geometry, mesh_prim: Prim):
         """POSITION/NORMAL/... accessors, built ONCE per unique mesh and
@@ -1777,7 +2002,8 @@ class SceneBuilder:
 
     # -- traversal -------------------------------------------------------------
 
-    def walk(self, prim: Prim, file: UsdFile, parent_children: list, depth=0):
+    def walk(self, prim: Prim, file: UsdFile, parent_children: list, depth=0,
+             world=None):
         if depth > 24 or prim is None:
             return
         self._visited += 1
@@ -1797,27 +2023,31 @@ class SceneBuilder:
             self.stats["skipped_shapes"] += 1
             return
 
+        local = prim_matrix(prim) if _has_xform(prim) else None
+        child_world = compose_matrix(world, local)
+
         if t == "PointInstancer":
-            self._walk_instancer(prim, file, parent_children, depth)
+            self._walk_instancer(prim, file, parent_children, depth, child_world)
             return
 
         if t in ("Mesh", "SkelRoot") or prim.get("points") is not None \
                 or prim.references:
-            self._walk_mesh(prim, file, parent_children, depth)
+            self._walk_mesh(prim, file, parent_children, depth, child_world,
+                            local)
             return
 
         children = []
         for child in prim.children:
-            self.walk(child, file, children, depth + 1)
+            self.walk(child, file, children, depth + 1, child_world)
         # generic prims (actor scopes, root components, nested xforms) keep
         # their own transform so the glTF node chain composes correctly
         node_idx = self.glb.add_node(
-            prim.name, children=children or None,
-            matrix=prim_matrix(prim) if _has_xform(prim) else None)
+            prim.name, children=children or None, matrix=local)
         parent_children.append(node_idx)
         self.stats["nodes"] += 1
 
-    def _walk_mesh(self, prim: Prim, file: UsdFile, parent_children: list, depth):
+    def _walk_mesh(self, prim: Prim, file: UsdFile, parent_children: list,
+                   depth, world=None, local=None):
         f, target = self._effective(prim, file)
         if target is None:
             self.stats["unresolved"] += 1
@@ -1833,16 +2063,22 @@ class SceneBuilder:
         if target.get("points") is None:
             # world/level reference or empty scope: splice its children
             children = []
+            spliced = False
             if target is not prim:
-                for child in target.children:
-                    self.walk(child, f, children, depth + 1)
+                if f is not None and str(f.path) in self.skip_files:
+                    # that world/level stage is composed as its own scene root
+                    # - splicing it here would duplicate every actor in it
+                    self.stats["skipped_level_splice"] += 1
+                else:
+                    for child in target.children:
+                        self.walk(child, f, children, depth + 1, world)
+                    spliced = True
             for child in prim.children:
-                self.walk(child, file, children, depth + 1)
+                self.walk(child, file, children, depth + 1, world)
             if children:
                 # apply the level-reference transform (usually identity)
                 node_idx = self.glb.add_node(
-                    prim.name, children=children,
-                    matrix=prim_matrix(prim) if _has_xform(prim) else None)
+                    prim.name, children=children, matrix=local)
                 parent_children.append(node_idx)
                 self.stats["nodes"] += 1
             return
@@ -1852,12 +2088,12 @@ class SceneBuilder:
         if mesh_idx is None:
             return
         node_idx = self.glb.add_node(
-            prim.name,
-            matrix=prim_matrix(prim) if _has_xform(prim) else None,
-            mesh=mesh_idx)
+            prim.name, matrix=local, mesh=mesh_idx)
         parent_children.append(node_idx)
         self.stats["mesh_instances"] += 1
         self.stats["nodes"] += 1
+        # `world` here is already the composed parent @ local of THIS node
+        self._record_placement(geo, target, prim, world)
         self._placed += 1
         if self._placed % 50 == 0:
             log("    ... %d meshes placed (at '%s')" % (self._placed, prim.name))
@@ -1870,11 +2106,54 @@ class SceneBuilder:
             if child.type_name == "GeomSubset" or \
                     (child.type_name == "Scope" and child.name == "OverrideMaterials"):
                 continue
-            self.walk(child, file, kids, depth + 1)
+            self.walk(child, file, kids, depth + 1, world)
         if kids:
             self.glb.nodes[node_idx]["children"] = kids
 
-    def _walk_instancer(self, prim: Prim, file: UsdFile, parent_children: list, depth):
+    def _register_asset(self, geo, mesh_prim):
+        """Registers the canonical source file of a geometry for map-scene.json
+        and returns its asset id."""
+        try:
+            rel = os.path.relpath(str(geo.source_file.path), str(self.map_dir))
+        except (ValueError, TypeError):
+            rel = str(getattr(geo.source_file, "path", "?"))
+        rel = rel.replace(os.sep, "/")
+        asset_id = "%s#%s" % (rel, mesh_prim.path)
+        if asset_id not in self.scene_assets:
+            self.scene_assets[asset_id] = {
+                "objectpath": asset_id,
+                "file": rel,
+                "assetkind": "staticmesh",
+                "name": mesh_prim.name,
+            }
+        return asset_id
+
+    def _record_placement(self, geo, mesh_prim, instance_prim, world):
+        """Record one placement for map-scene.json (the raw data file that
+        tells you where each mesh is placed in the world).
+
+        `world` is the composed stage-space world matrix of the placed mesh
+        node (parent chain @ its own xform)."""
+        if self.map_dir is None or self._instances_truncated:
+            return
+        if len(self.scene_instances) >= _SCENE_INSTANCE_CAP:
+            self._instances_truncated = True
+            warn("map-scene.json instance cap (%s) reached - remaining "
+                 "placements are only in the .glb" % fmat(_SCENE_INSTANCE_CAP))
+            return
+        asset_id = self._register_asset(geo, mesh_prim)
+        m = world if world is not None else \
+            [1.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0,
+             0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 1.0]
+        self.scene_instances.append({
+            "name": _safe_name(instance_prim.name),
+            "sourceobjectpath": asset_id,
+            "assetkind": "staticmesh",
+            "transform": usd_matrix_to_ue_transform(m),
+        })
+
+    def _walk_instancer(self, prim: Prim, file: UsdFile, parent_children: list,
+                        depth, world=None):
         protos = []
         for path in prim.rels.get("prototypes") or []:
             p = file.by_path.get(path)
@@ -1886,6 +2165,7 @@ class SceneBuilder:
             return
 
         proto_meshes = []
+        proto_assets = []
         for proto in protos:
             f, target = self._effective(proto, file)
             if target is not None and target.type_name == "SkelRoot":
@@ -1893,10 +2173,15 @@ class SceneBuilder:
                                if c.type_name == "Mesh"), None)
             if target is None or target.get("points") is None:
                 proto_meshes.append(None)
+                proto_assets.append(None)
                 continue
             geo = self._geometry_of(f, target)
             proto_meshes.append(self._gltf_mesh(geo, target, proto, file,
                                                 target.name))
+            if self.map_dir is not None and not self._instances_truncated:
+                proto_assets.append(self._register_asset(geo, target))
+            else:
+                proto_assets.append(None)
 
         proto_indices = int_list(prim.get("protoIndices"))
         positions = prim.get("positions")
@@ -1943,6 +2228,23 @@ class SceneBuilder:
             self.glb.nodes.append(node)
             inst_children.append(len(self.glb.nodes) - 1)
             self.stats["instanced_points"] += 1
+            # per-instance placement for map-scene.json
+            if world is not None and proto_assets and \
+                    proto_indices[i] < len(proto_assets) and \
+                    proto_assets[proto_indices[i]]:
+                if len(self.scene_instances) >= _SCENE_INSTANCE_CAP:
+                    self._instances_truncated = True
+                    warn("map-scene.json instance cap (%s) reached - "
+                         "remaining placements are only in the .glb"
+                         % fmat(_SCENE_INSTANCE_CAP))
+                else:
+                    m = mat4_mul(world, node_matrix((px, py, pz), q, s))
+                    self.scene_instances.append({
+                        "name": _safe_name("%s_%d" % (prim.name, i)),
+                        "sourceobjectpath": proto_assets[proto_indices[i]],
+                        "assetkind": "staticmesh",
+                        "transform": usd_matrix_to_ue_transform(m),
+                    })
 
         # the instancer prim itself is a component with its own transform
         node_idx = self.glb.add_node(
@@ -1983,11 +2285,105 @@ def _peek_scope(p: Path) -> bool:
     return False
 
 
-def discover_world_file(map_dir: Path):
-    """The persistent world = largest Scope-rooted .usda (or manifest-listed)."""
+def _world_header_info(p: Path):
+    """(scope_rooted, has_sublayers) from the first 4 KB of a .usda file."""
+    try:
+        with open(_norm_path(p), "rb") as fh:
+            head = fh.read(4096)
+    except OSError:
+        return False, False
+    if b"\x00" in head:                      # possibly UTF-16
+        try:
+            head = head.decode("utf-16-le", "replace").encode("utf-8", "ignore")
+        except Exception:
+            return False, False
+    return b"def Scope" in head, b"subLayers" in head
+
+
+def _looks_like_world(p: Path) -> bool:
+    """True if p looks like a WORLD STAGE file.
+
+    World stages are written to <package path>.usda, i.e.
+        .../Levels/<World>.usda   next to the <World>/PersistentLevel/ folders
+    while spline/landscape component layers always sit INSIDE a
+    PersistentLevel folder and mesh/material assets are not Scope-rooted.
+    """
+    parts = [x.lower() for x in p.parts]
+    if "persistentlevel" in parts:
+        return False
+    is_scope, has_sub = _world_header_info(p)
+    if not is_scope:
+        return False
+    if p.parent.name.lower() == "levels":
+        return True
+    if has_sub:
+        return True
+    # fallback: world file sitting next to its own actor folder
+    try:
+        return (p.parent / p.stem / "PersistentLevel").is_dir() or \
+               (p.parent / p.stem / "persistentlevel").is_dir()
+    except OSError:
+        return False
+
+
+def discover_world_files(map_dir: Path):
+    """ALL world stages of the map (persistent world + streamed sublevels).
+
+    A Session map is spread across SEVERAL world packages - the exporter runs
+    one WorldExporter per package, so a map export contains several sibling
+    world stages (e.g. PHL01_FDR_Art_LevelArchitecture / _Props / _Unmerged).
+    Composing only the largest one silently dropped the rest of the map
+    (that is exactly why skatepark / city geometry was missing)."""
     manifest = map_dir / "export-manifest.json"
     listed = []
     if manifest.exists():
+        try:
+            data = json.loads(read_text_best_effort(manifest))
+            for rel in data.get("sourceWorlds") or []:
+                p = _norm_path(map_dir / str(rel))
+                if p.suffix.lower() != ".usda" or not p.exists():
+                    continue
+                # the manifest may also list component/mesh layers (old
+                # exporter builds) - keep only actual world stages
+                if _looks_like_world(p):
+                    listed.append(p)
+        except Exception as exc:
+            warn("manifest unreadable: %s" % exc)
+    if listed:
+        listed = list(dict.fromkeys(listed))
+        # stages that compose other stages (persistent world) first
+        listed.sort(key=lambda p: (not _world_header_info(p)[1], str(p)))
+        log("world stages (from export-manifest.json): %d" % len(listed))
+        return listed
+
+    src = map_dir / "source"
+    search_root = src if src.is_dir() else map_dir
+    log("scanning %s for world stages..." % _display(search_root))
+    t0 = time.perf_counter()
+    found = []
+    seen = 0
+    for p in search_root.rglob("*.usda"):
+        seen += 1
+        if seen % 500 == 0:
+            log("  ... %d .usda files scanned" % seen)
+            step("scanning for world stages (%d files)" % seen)
+        if _looks_like_world(p):
+            found.append(_norm_path(p))
+    log("  %d .usda file(s) scanned, %d world stage(s) found in %.1fs"
+        % (seen, len(found), time.perf_counter() - t0))
+    if found:
+        return sorted(dict.fromkeys(found), key=lambda p: str(p))
+
+    # last resort: the old single-world heuristic (no manifest trust here)
+    single = discover_world_file(map_dir, use_manifest=False)
+    return [_norm_path(single)] if single is not None else []
+
+
+def discover_world_file(map_dir: Path, use_manifest: bool = True):
+    """Legacy fallback: the largest Scope-rooted .usda (or manifest-listed)."""
+    manifest = map_dir / "export-manifest.json"
+    listed = []
+    if use_manifest and manifest.exists():
         try:
             data = json.loads(read_text_best_effort(manifest))
             for rel in data.get("sourceWorlds") or []:
@@ -2073,48 +2469,69 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
     log("")
     log("=== %s ===" % map_name)
     _HB.start()
-    step("discovering world stage")
+    step("discovering world stages")
 
-    world_file = discover_world_file(map_dir)
-    if world_file is None:
+    world_files = discover_world_files(map_dir)
+    if not world_files:
         warn("no .usda world file found - skipping")
         return {"map": map_name, "ok": False, "error": "no world usda"}
 
-    try:
-        rel = world_file.relative_to(map_dir)
-    except ValueError:
-        rel = world_file
-    log("world stage: %s" % _display(rel))
-
-    step("composing world stage")
-    stage = Stage(world_file)
+    step("composing world stages")
+    stage = Stage(world_files[0])
     if stage.root_file is None:
         warn("world stage failed to parse - skipping this map")
         return {"map": map_name, "ok": False, "error": "world stage unparsable"}
     log("stage composed: %d layer(s) in %.1fs"
         % (len(stage.cache), time.perf_counter() - t_start))
 
-    log("building scene: referenced layers load on demand...")
+    log("building scene: %d world stage(s), referenced layers load on "
+        "demand..." % len(world_files))
     step("building scene graph")
     glb = GLBBuilder()
     materials = MaterialLibrary(stage, glb)
-    scene = SceneBuilder(stage, glb, materials)
+    scene = SceneBuilder(stage, glb, materials,
+                         skip_files=world_files, map_dir=map_dir)
 
     children = []
-    root_prim = stage.default_prim()
-    if root_prim is not None:
-        for child in root_prim.children:
-            scene.walk(child, stage.root_file, children)
-    elif stage.root_file is not None:
-        for rp in stage.root_file.roots:
-            scene.walk(rp, stage.root_file, children)
-
-    if stage.root_file is not None:
-        for asset in stage.root_file.sublayers:
-            sub_file = stage._load(stage.resolve_asset(stage.root_file, asset))
-            if sub_file is not None:
-                for rp in sub_file.roots:
-                    scene.walk(rp, sub_file, children)
+    # every world stage is composed exactly once - mark them ALL as walked
+    # up front, so a subLayer/reference from one stage into another stage
+    # never pulls the same actors in twice
+    walked = {_norm_path(p) for p in world_files}
+    for wi, wf in enumerate(world_files, 1):
+        f = stage._load(wf)
+        if f is None:
+            continue
+        walked.add(f.path)
+        try:
+            rel = f.path.relative_to(map_dir)
+        except ValueError:
+            rel = f.path
+        if len(world_files) > 1:
+            log("world stage %d/%d: %s" % (wi, len(world_files), _display(rel)))
+        else:
+            log("world stage: %s" % _display(rel))
+        dp = f.by_path.get("/" + (f.default_prim or ""))
+        if dp is None and f.roots:
+            dp = f.roots[0]
+        kids = []
+        if dp is not None:
+            scene.walk(dp, f, kids)
+        else:
+            for rp in f.roots:
+                scene.walk(rp, f, kids)
+        children.extend(kids)
+        # compose this stage's own subLayers that are NOT among the world
+        # stages we walk anyway (auxiliary worlds that were not exported
+        # as part of the map group)
+        for asset in f.sublayers or []:
+            sub_file = stage._load(stage.resolve_asset(f, asset))
+            if sub_file is None or sub_file.path in walked:
+                continue
+            walked.add(sub_file.path)
+            warn("composing unlisted subLayer of %s: %s"
+                 % (f.path.name, sub_file.path.name))
+            for rp in sub_file.roots:
+                scene.walk(rp, sub_file, children)
 
     st = scene.stats
     log("scene built in %.1fs: %s nodes, %s unique meshes, %s mesh "
@@ -2122,10 +2539,44 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
         % (time.perf_counter() - t_start, fmat(st["nodes"]),
            fmat(st["unique_meshes"]), fmat(st["mesh_instances"]),
            fmat(st["instanced_points"]), fmat(st["triangles"])))
+    if st["deduped_geometry"]:
+        log("  geometry dedupe: %s identical baked mesh copy/copies collapsed "
+            "into shared mesh data" % fmat(st["deduped_geometry"]))
     if st["unresolved"]:
         log("  NOTE: %s prim(s) had unresolved mesh references - that "
             "geometry is missing from the .glb (details in warnings)"
             % fmat(st["unresolved"]))
+
+    # the placement manifest (import_to_blender.py reads this)
+    scene_file = None
+    if scene.map_dir is not None and (scene.scene_assets or scene.scene_instances):
+        scene_file = map_dir / "map-scene.json"
+        try:
+            doc = {
+                "mapname": map_name,
+                "metersPerUnit": 0.01,
+                "upAxis": "Z",
+                "worldStages": [
+                    (os.path.relpath(str(p), str(map_dir)).replace(os.sep, "/"))
+                    for p in world_files],
+                "assets": list(scene.scene_assets.values()),
+                "instances": scene.scene_instances,
+                "generator": "build_map.py",
+                "generatedAtUtc": time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                time.gmtime()),
+            }
+            if scene._instances_truncated:
+                doc["instancesTruncated"] = True
+            scene_file.write_text(json.dumps(doc, separators=(",", ":")),
+                                  encoding="utf-8")
+            log("wrote map-scene.json: %s unique assets, %s placements "
+                "(raw placement data for import_to_blender.py)"
+                % (fmat(len(scene.scene_assets)),
+                   fmat(len(scene.scene_instances))))
+            del doc
+        except Exception as exc:
+            warn("cannot write map-scene.json: %s" % exc)
+            scene_file = None
 
     # the root node carries the whole stage->glTF space conversion
     root_idx = glb.add_node(map_name, children=children or None,
@@ -2143,12 +2594,22 @@ def build_map(map_dir: Path, out_path: Path = None) -> dict:
                                     time.perf_counter() - t_write))
 
     peak = _peak_rss_bytes()
+    try:
+        world_rels = [
+            os.path.relpath(str(p), str(map_dir)).replace(os.sep, "/")
+            for p in world_files]
+    except ValueError:
+        world_rels = [str(p) for p in world_files]
     report = {
         "map": map_name,
         "ok": True,
         "output": _display(out_path),
         "size_mb": round(total / (1024 * 1024), 2),
-        "world_stage": _display(world_file),
+        "world_stages": world_rels,
+        "world_count": len(world_files),
+        "scene_manifest": _display(scene_file) if scene_file else None,
+        "scene_assets": len(scene.scene_assets),
+        "scene_instances": len(scene.scene_instances),
         "stats": scene.stats,
         "materials": len(glb.materials),
         "textures": len(glb.images),

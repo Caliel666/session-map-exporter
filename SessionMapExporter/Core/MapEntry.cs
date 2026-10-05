@@ -1,6 +1,6 @@
 namespace SessionMapExporter.Core;
 
-public sealed record MapEntry(string Path)
+public sealed record MapEntry(string Path, int StreamingLevels = 0)
 {
     public string DisplayName
     {

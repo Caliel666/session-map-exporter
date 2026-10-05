@@ -110,7 +110,7 @@ public partial class MainWindow : Window
                 _items.Add(new MapItem
                 {
                     Title = group.DisplayName,
-                    Detail = $"{group.Worlds.Count} world{(group.Worlds.Count == 1 ? "" : "s")} · exports {group.PrimaryName}",
+                    Detail = $"{group.Worlds.Count} world{(group.Worlds.Count == 1 ? "" : "s")} · exports the full map (all worlds)",
                     Group = group,
                 });
             }
@@ -229,7 +229,8 @@ public partial class MainWindow : Window
                         MapGrouping.Sanitize(Path.GetFileNameWithoutExtension(world.Path.Replace('\\', '/'))));
 
                 if (seen.Add(world.Path))
-                    requests.Add(new ExportRequest(world, folder, Path.GetFileName(folder)));
+                    requests.Add(new ExportRequest(new[] { world }, folder,
+                        Path.GetFileName(folder)));
             }
         }
         else
@@ -238,7 +239,7 @@ public partial class MainWindow : Window
             {
                 var group = item.Group!;
                 if (seen.Add(group.Key))
-                    requests.Add(new ExportRequest(group.Primary, group.FolderName, group.DisplayName));
+                    requests.Add(new ExportRequest(group.Worlds, group.FolderName, group.DisplayName));
             }
         }
 
