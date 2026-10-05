@@ -181,7 +181,7 @@ public sealed class ArchiveService
         foreach (var asset in uniqueAssets.Values)
             assetSession.Add(asset);
 
-        progress?.Report($"Exporting {uniqueAssets.Count} unique mesh assets for {map.DisplayName}…");
+        progress?.Report($"Exporting {uniqueAssets.Count} unique mesh assets for {request.DisplayName}…");
         var assetsOut = Path.Combine(mapOut, "Assets");
         Directory.CreateDirectory(assetsOut);
 
