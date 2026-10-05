@@ -69,8 +69,8 @@ public partial class MainWindow : Window
             RebuildList();
 
             StatusText.Text = _groups.Count == 0
-                ? "No actual UWorld packages were found."
-                : "Ready — each map export includes every UWorld package in that map group, then build_map.py flattens the USD composition into a complete GLB.";
+                ? "No .umap worlds were found."
+                : "Ready — pick one or more maps and export. Each export lands in Maps/<map name>/ with a build_map.py that produces a .glb for Blender.";
 
             ExportButton.IsEnabled = _groups.Count > 0;
         }
@@ -110,7 +110,7 @@ public partial class MainWindow : Window
                 _items.Add(new MapItem
                 {
                     Title = group.DisplayName,
-                    Detail = $"{group.Worlds.Count} world{(group.Worlds.Count == 1 ? "" : "s")} · all worlds exported together",
+                    Detail = $"{group.Worlds.Count} world{(group.Worlds.Count == 1 ? "" : "s")} · exports {group.PrimaryName}",
                     Group = group,
                 });
             }
@@ -187,9 +187,9 @@ public partial class MainWindow : Window
                 _cts.Token);
 
             var outPath = Path.GetFullPath(output);
-            StatusText.Text = $"Finished exporting {requests.Count} map(s) to {outPath}. Run 'python build_map.py' inside a map folder to build the complete GLB with Blender.";
+            StatusText.Text = $"Finished exporting {requests.Count} map(s) to {outPath}. Run 'python build_map.py' there to get .glb files for Blender.";
             System.Windows.MessageBox.Show(
-                $"Export complete.\n\nOutput: {outPath}\n\nNext step:\n  1. Open a terminal in the exported map folder.\n  2. Run:  python build_map.py\n  3. Import the generated .glb into Blender.\n\nThe exporter included all worlds in the selected map group.",
+                $"Export complete.\n\nOutput: {outPath}\n\nNext step:\n  1. Open a terminal in the output folder.\n  2. Run:  python build_map.py\n  3. In Blender: File -> Import -> glTF 2.0 -> pick the .glb",
                 "Session Map Exporter",
                 MessageBoxButton.OK, MessageBoxImage.Information);
         }
@@ -229,7 +229,7 @@ public partial class MainWindow : Window
                         MapGrouping.Sanitize(Path.GetFileNameWithoutExtension(world.Path.Replace('\\', '/'))));
 
                 if (seen.Add(world.Path))
-                    requests.Add(new ExportRequest(new[] { world }, folder, Path.GetFileName(folder)));
+                    requests.Add(new ExportRequest(world, folder, Path.GetFileName(folder)));
             }
         }
         else
@@ -238,7 +238,7 @@ public partial class MainWindow : Window
             {
                 var group = item.Group!;
                 if (seen.Add(group.Key))
-                    requests.Add(new ExportRequest(group.Worlds, group.FolderName, group.DisplayName));
+                    requests.Add(new ExportRequest(group.Primary, group.FolderName, group.DisplayName));
             }
         }
 

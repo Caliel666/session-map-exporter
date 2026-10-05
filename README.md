@@ -1,72 +1,32 @@
 # Session Skate Sim Map Exporter
 
-Windows/WPF exporter for Session: Skate Sim.
+Windows/WPF exporter for Session Skate Sim worlds.
 
 ## What it does
 
-- Select a Session installation directory.
-- Enter the AES key at runtime; it is not hard-coded or written into the project.
-- Mount Session's PAK/IoStore archives with CUE4Parse.
-- Inspect mounted `.umap` packages and only list packages that resolve to an actual `UWorld`.
-- Export a selected world as a **consolidated map scene**, including its streaming worlds, instead of exporting every auxiliary `.umap` as a separate map.
-- Export each referenced mesh/spline/landscape asset **once** and store actor placements as lightweight instances.
-- Export USD/USDA assets plus a compact `map-scene.json`.
-- Generate a Blender Python importer that loads each unique asset once and creates linked object instances.
-- Never generate a giant `_flattened_map.usda` scene.
-- Optionally omit Unreal light objects from the generated Blender scene.
+* Select a Session installation directory.
+* Enter the AES key at runtime (nothing is hard-coded).
+* Mount the game's PAK/IoStore archives with CUE4Parse.
+* Enumerate **every virtual `.umap`** found in all mounted archives. There is no hardcoded map list.
+* **Consolidates the world list into real maps.** Session ships dozens of auxiliary worlds per map (`…_Art`, `_Audio`, `_Lights`, `_Vege`, `_Unmerged`, …); the map selector shows one entry per map (e.g. *LESColemen Park*) with a chosen primary world, not 700+ raw packages. Tick **Show individual worlds** to see the raw list again.
+* Search/filter the map list.
+* Export one, several, or all maps.
+* Uses CUE4Parse-Conversion's `ExportSession`, which has native handlers for UWorld, static meshes, textures, materials, landscapes and spline meshes.
+* Writes **clean per-map output folders** (see below) instead of mirroring the whole game package tree.
+* Ships **one `build_map.py`** per export that turns the raw USD data into a **single `.glb` (glTF 2.0) file with all textures embedded** — which you import straight into Blender. No `bpy`, no Blender scripting, no per-map broken helper scripts.
+* Does not intentionally add/export Unreal light actors as a new Blender lighting rig.
 
-## Why the exporter does not create a giant world USD
+## Requirements
 
-CUE4Parse's built-in `WorldExporter` walks the world and queues meshes, spline meshes, landscapes and materials for export. Its USD world format is useful as an interchange representation, but composing that whole scene into one flattened USD stage can become enormous for a game world.
-
-This project therefore uses CUE4Parse's world DTOs only to **read the world hierarchy**. It builds its own lightweight scene manifest:
-
-```text
-map-scene.json
-    ├── unique asset A -> Assets/...usda
-    ├── unique asset B -> Assets/...usda
-    └── placements -> transforms referencing A/B
-```
-
-Blender imports each unique USD asset once and duplicates/links the resulting mesh datablocks for all placements. This avoids loading the same geometry thousands of times into memory.
-
-## Export layout
-
-```text
-Exports/
-└── Maps/
-    └── <Map>/
-        ├── export-manifest.json
-        ├── map-scene.json
-        ├── import_to_blender.py
-        └── Assets/
-            ├── SessionGame/
-            │   └── Content/
-            │       └── ... unique referenced assets ...
-            └── Engine/
-                └── Content/
-                    └── ... only if actually referenced ...
-```
-
-There is deliberately **no** `_flattened_map.usda`.
-
-## Blender import
-
-Run the generated `import_to_blender.py` with Blender's bundled Python, or open Blender and execute the script from the Text Editor.
-
-The script:
-
-1. Reads `map-scene.json`.
-2. Imports every unique USD asset exactly once.
-3. Creates linked Blender object instances for the recorded placements.
-4. Keeps the imported prototypes in a hidden collection.
-5. Does not import game lights when the no-lighting option is enabled.
-
-Do not attempt to import a flattened USD stage; none is produced.
+* Visual Studio 2022/2026 with the .NET 10 SDK and Desktop development workload.
+* Windows x64.
+* A legally installed copy of Session Skate Sim.
+* The game's AES key.
+* For the Blender step: any Python 3.8+ (standard library only; `pip install pillow` is an optional extra).
 
 ## Build
 
-Open `SessionMapExporter.sln` in Visual Studio with the .NET 10 SDK and Desktop development workload.
+Open `SessionMapExporter.sln` in Visual Studio and Build > Build Solution.
 
 Or:
 
@@ -75,28 +35,57 @@ dotnet restore
 dotnet build -c Release
 ```
 
-The project pins CUE4Parse and CUE4Parse-Conversion 1.2.2.202610.
+The first restore downloads CUE4Parse and CUE4Parse-Conversion from NuGet.
 
 ## Use
 
 1. Select the Session installation folder.
-2. Enter the AES key.
+2. Paste the AES key into the AES key field.
 3. Click **Scan game**.
-4. Select one or more actual worlds.
-5. Choose an output directory.
+4. Pick one or more maps from the list (expand *Show individual worlds* if you need a specific raw world package).
+5. Choose an output folder.
 6. Click **EXPORT SELECTED MAPS**.
-7. Run the generated `Maps/<map>/import_to_blender.py` from Blender's Python environment.
+7. Open a terminal in the output folder and run:
 
-## Fidelity / limitations
+   ```powershell
+   python build_map.py
+   ```
 
-- World streaming levels are recursively consolidated into the selected world scene.
-- Static meshes, skeletal meshes, geometry collections, spline mesh components and landscape components are handled through CUE4Parse-Conversion.
-- Instanced static meshes become repeated linked Blender objects using one shared mesh datablock.
-- Spline mesh components remain individual exported assets because their deformation can differ even when they use the same source static mesh.
-- Unreal light actors are represented only when lighting export is enabled; the default no-lighting option removes them from the Blender scene.
-- This exporter does not intentionally import Unreal baked lightmap lighting.
-- Some Unreal-specific material/shader behavior cannot be represented perfectly by Blender's USD importer.
+   (build one map only: `python build_map.py "Maps/LESColemen Park"`)
+
+8. In Blender: **File → Import → glTF 2.0** and pick `Maps/<map name>/<map name>.glb`.
+
+## Export layout
+
+```
+Exports/
+├── build_map.py                     the one and only helper script
+├── README.txt                       the instructions above, offline
+├── maps-export-summary.json
+└── Maps/
+    └── LESColemen Park/             one folder per map - proper files, proper places
+        ├── export-manifest.json
+        ├── LESColemen Park.glb      ← built by build_map.py; import this into Blender
+        ├── build-report.json        ← what was built / skipped / missing textures
+        └── source/                  raw USD/USDA + textures (the master copy)
+```
+
+The old behaviour (a `SessionGame/Content/Art/Env/...` tree plus a per-map
+`import_to_blender.py` that crashed with `ModuleNotFoundError: No module named
+'bpy'`) is gone. `import_to_blender.py` needed Blender's embedded Python and
+gave no standalone model; `build_map.py` runs on plain Python and produces a
+clean asset instead.
+
+## Notes on fidelity
+
+* Geometry is exported in metres, +Y up, glTF conventions — CUE4Parse's exact coordinate mapping.
+* Materials become glTF PBR materials (base colour, normal, ORM metallic/roughness, emissive, alpha masked/translucent).
+* Point instancers (foliage, props) become real shared-mesh instances.
+* Game lights, collision/guide shapes and invisible prims are skipped.
+* Texture files referenced by materials are resolved even in old exports where all-mip export wrote `T_Name_MIP0.png` while materials pointed at `T_Name.png` (the exporter now exports the referenced mip only).
 
 ## Important
+
+The CUE4Parse API is versioned. This project pins the current 1.2.2.202610 packages. If a future release changes an API, update the two package versions together.
 
 The exporter deliberately does not ship or embed an AES key. The key entered into the UI exists only for the running process.
