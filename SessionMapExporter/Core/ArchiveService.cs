@@ -4,6 +4,7 @@ using CUE4Parse;
 using CUE4Parse.Encryption.Aes;
 using CUE4Parse.FileProvider;
 using CUE4Parse.UE4.Objects.Core.Misc;
+using CUE4Parse.UE4.Objects.Engine;
 using CUE4Parse.UE4.Versions;
 using CUE4Parse_Conversion;
 using CUE4Parse_Conversion.Options;
@@ -133,7 +134,7 @@ public sealed class ArchiveService
 
             progress?.Report($"Loading {request.DisplayName} ({request.Worlds.Count} world packages)…");
 
-            var loadedWorlds = new List<(MapEntry Entry, CUE4Parse.UE4.Assets.Exports.UWorld World)>();
+            var loadedWorlds = new List<(MapEntry Entry, UWorld World)>();
             foreach (var worldEntry in request.Worlds)
             {
                 ct.ThrowIfCancellationRequested();
@@ -141,7 +142,7 @@ public sealed class ArchiveService
 
                 var package = Provider.LoadPackage(worldEntry.Path);
                 var world = package.GetExports()
-                    .OfType<CUE4Parse.UE4.Assets.Exports.UWorld>()
+                    .OfType<UWorld>()
                     .FirstOrDefault();
 
                 if (world is null)
@@ -163,6 +164,8 @@ public sealed class ArchiveService
                 });
                 continue;
             }
+
+            var queuedWorldObjectPaths = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
 
             ExportSession? session = null;
             session = new ExportSession((args, filterCt) =>
