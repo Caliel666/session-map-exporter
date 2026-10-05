@@ -141,9 +141,20 @@ public sealed class ArchiveService
                 continue;
             }
 
-            var session = new ExportSession
+            ExportSession? session = null;
+            session = new ExportSession((args, filterCt) =>
             {
-                MaxDegreeOfParallelism = Math.Max(1, Environment.ProcessorCount - 1)
+                // WorldExporter writes streaming-level references, but its built-in
+                // queueing only follows levels marked persistent. Session uses a large
+                // streamed world, so explicitly queue every referenced streaming world.
+                foreach (var level in args.StreamingLevels)
+                {
+                    filterCt.ThrowIfCancellationRequested();
+                    session.Add(level.World);
+                }
+            })
+            {
+                MaxDegreeOfParallelism = 1
             };
 
             session.Add(world);
@@ -228,199 +239,105 @@ public sealed class ArchiveService
 
     private static ExportOptions BuildExportOptions(bool textures, bool materials)
     {
-        // ExportOptions uses MeshFormat (not MeshExportFormat). WorldExporter currently
-        // supports USD only; selecting UEFormat here produces the exact exception this
-        // application previously hit.
+        // ExportOptions uses primary-constructor parameters and exposes readonly fields.
+        // Reflection against properties therefore cannot change MeshFormat after construction.
+        // Construct it with the current CUE4Parse values instead.
         var type = typeof(ExportOptions);
-        var ctor = type.GetConstructors()
-            .OrderByDescending(c => c.GetParameters().Length)
+        var ctor = type.GetConstructors().OrderByDescending(x => x.GetParameters().Length).First();
+
+        var args = ctor.GetParameters().Select(p =>
+        {
+            var name = p.Name ?? string.Empty;
+            var t = p.ParameterType;
+
+            if (t.IsEnum)
+            {
+                var preferred = name switch
+                {
+                    var n when n.Contains("meshFormat", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "USD" },
+                    var n when n.Contains("nanite", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "NoNanite" },
+                    var n when n.Contains("meshQuality", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "Lowest" },
+                    var n when n.Contains("texturePlatform", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "DesktopMobile" },
+                    var n when n.Contains("textureFormat", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "Png" },
+                    var n when n.Contains("materialDepth", StringComparison.OrdinalIgnoreCase) =>
+                        materials ? new[] { "AllLayersNoRef" } : new[] { "TopLayerOnly" },
+                    var n when n.Contains("socketFormat", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "Bone" },
+                    var n when n.Contains("compressionFormat", StringComparison.OrdinalIgnoreCase) =>
+                        new[] { "None" },
+                    _ => Array.Empty<string>()
+                };
+
+                foreach (var candidate in preferred)
+                {
+                    var match = Enum.GetNames(t).FirstOrDefault(x =>
+                        x.Equals(candidate, StringComparison.OrdinalIgnoreCase));
+                    if (match is not null)
+                        return Enum.Parse(t, match, true);
+                }
+
+                return Enum.GetValues(t).GetValue(0)!;
+            }
+
+            if (t == typeof(bool))
+            {
+                return name switch
+                {
+                    var n when n.Contains("exportHdrTexturesAsHdr", StringComparison.OrdinalIgnoreCase) => false,
+                    var n when n.Contains("exportAllTextureMips", StringComparison.OrdinalIgnoreCase) => false,
+                    var n when n.Contains("exportMaterials", StringComparison.OrdinalIgnoreCase) => materials,
+                    var n when n.Contains("exportMorphTargets", StringComparison.OrdinalIgnoreCase) => false,
+                    _ => false
+                };
+            }
+
+            if (t == typeof(int))
+                return name.Contains("textureQuality", StringComparison.OrdinalIgnoreCase) ? 95 : 0;
+
+            if (t == typeof(float)) return 1f;
+            if (t == typeof(double)) return 1d;
+
+            return t.IsValueType ? Activator.CreateInstance(t) : null;
+        }).ToArray();
+
+        return (ExportOptions)ctor.Invoke(args);
+    }
+
+    private static void WriteBlenderHelper(string mapOut)
+    {
+        // Import ONLY the top-level world stage. Its USD subLayers/references pull in
+        // the streaming levels and mesh assets. Importing every .usda recursively
+        // duplicates the entire scene and can exhaust Blender's RAM.
+        var worldFile = Directory.EnumerateFiles(mapOut, "*.usda", SearchOption.TopDirectoryOnly)
+            .OrderBy(x => x, StringComparer.OrdinalIgnoreCase)
             .FirstOrDefault();
 
-        if (ctor is null)
-            throw new InvalidOperationException("CUE4Parse-Conversion did not expose an ExportOptions constructor.");
+        var script = $"""
+import bpy
+from pathlib import Path
 
-        var args = ctor.GetParameters()
-            .Select(p => DefaultForParameter(p.ParameterType, p.Name ?? ""))
-            .ToArray();
+ROOT = Path(__file__).resolve().parent
+WORLD = Path(r"{worldFile ?? ""}")
 
-        var instance = (ExportOptions)ctor.Invoke(args);
+if not WORLD.exists():
+    raise FileNotFoundError(f"World USD not found: {{WORLD}}")
 
-        SetEnumProperty(instance, "MeshFormat", "USD");
-        SetEnumProperty(instance, "TextureExportFormat", "Png", "PNG");
-        SetEnumProperty(instance, "MaterialExportFormat", materials ? "AllLayersNoRef" : "TopLayerOnly");
-        SetBoolProperty(instance, "SaveEmbeddedMaterials", materials);
-        SetBoolProperty(instance, "ExportMaterials", materials);
-        // NOTE: must stay false. USD material files reference "<Texture>.png" without a
-        // mip suffix; with all-mips enabled the exporter writes T_Name_MIP0.png etc. and
-        // every material silently lost its textures. (build_map.py tolerates old
-        // _MIP* folders, but fresh exports no longer produce them.)
-        SetBoolProperty(instance, "ExportAllTextureMips", false);
-        SetBoolProperty(instance, "SaveHdrTexturesAsHdr", false);
-        return instance;
+print("SessionMapExporter: importing persistent world:", WORLD)
+bpy.ops.wm.usd_import(filepath=str(WORLD))
+
+# Game lighting is intentionally not part of the exported stage when that option
+# was enabled. Remove any residual imported light objects defensively.
+for obj in list(bpy.data.objects):
+    if obj.type == 'LIGHT':
+        bpy.data.objects.remove(obj, do_unlink=True)
+
+print("SessionMapExporter: world import complete.")
+""";
+        File.WriteAllText(Path.Combine(mapOut, "import_to_blender.py"), script);
     }
 
-    private static object? DefaultForParameter(Type t, string name)
-    {
-        if (t.IsEnum)
-        {
-            var preferred = name.Contains("mesh", StringComparison.OrdinalIgnoreCase)
-                ? new[] { "USD", "Gltf", "GLTF", "glTF", "Fbx", "FBX", "UEFormat" }
-                : name.Contains("texture", StringComparison.OrdinalIgnoreCase)
-                    ? new[] { "Png", "PNG" }
-                    : name.Contains("material", StringComparison.OrdinalIgnoreCase)
-                        ? new[] { "TopLayerOnly", "AllLayersNoRef" }
-                        : new[] { "None" };
-
-            foreach (var candidate in preferred)
-                if (Enum.GetNames(t).Contains(candidate, StringComparer.OrdinalIgnoreCase))
-                    return Enum.Parse(t, candidate, true);
-
-            return Enum.GetValues(t).GetValue(0);
-        }
-
-        if (t == typeof(bool))
-            return name.Contains("SaveEmbedded", StringComparison.OrdinalIgnoreCase);
-        if (t == typeof(int)) return 100;
-        if (t == typeof(float)) return 1f;
-        if (t == typeof(double)) return 1d;
-        if (t == typeof(string)) return "";
-        return t.IsValueType ? Activator.CreateInstance(t) : null;
-    }
-
-    private static void SetEnumProperty(object obj, string property, params string[] names)
-    {
-        var p = obj.GetType().GetProperty(property);
-        if (p?.CanWrite != true || !p.PropertyType.IsEnum) return;
-
-        foreach (var name in names)
-        {
-            var match = Enum.GetNames(p.PropertyType)
-                .FirstOrDefault(x => x.Equals(name, StringComparison.OrdinalIgnoreCase));
-
-            if (match is not null)
-            {
-                p.SetValue(obj, Enum.Parse(p.PropertyType, match, true));
-                return;
-            }
-        }
-    }
-
-    private static void SetBoolProperty(object obj, string property, bool value)
-    {
-        var p = obj.GetType().GetProperty(property);
-        if (p?.CanWrite == true && p.PropertyType == typeof(bool))
-            p.SetValue(obj, value);
-    }
-
-    private static void StripUsdLights(string root)
-    {
-        foreach (var file in Directory.EnumerateFiles(root, "*.usda", SearchOption.AllDirectories))
-        {
-            var text = File.ReadAllText(file);
-            var stripped = RemoveUsdLightPrims(text);
-            if (!ReferenceEquals(text, stripped) && !text.Equals(stripped, StringComparison.Ordinal))
-                File.WriteAllText(file, stripped);
-        }
-    }
-
-    // WorldExporter serializes light components as USD light prims. Remove those prim
-    // blocks from the ASCII stage when the user explicitly requested fresh Blender
-    // lighting. This also handles sublayer files produced for streaming worlds.
-    private static string RemoveUsdLightPrims(string text)
-    {
-        var lightTypes = new[]
-        {
-            "DistantLight", "SphereLight", "RectLight", "DiskLight",
-            "DomeLight", "CylinderLight", "PortalLight", "Light"
-        };
-
-        var lines = text.Split(new[] { "\r\n", "\n" }, StringSplitOptions.None);
-        var output = new List<string>(lines.Length);
-
-        for (var i = 0; i < lines.Length; i++)
-        {
-            var trimmed = lines[i].TrimStart();
-            var isLight = lightTypes.Any(type =>
-                trimmed.StartsWith($"def {type} ", StringComparison.Ordinal) ||
-                trimmed.StartsWith($"over {type} ", StringComparison.Ordinal));
-
-            if (!isLight)
-            {
-                output.Add(lines[i]);
-                continue;
-            }
-
-            var depth = CountBraces(lines[i]);
-            while (i + 1 < lines.Length && depth > 0)
-            {
-                i++;
-                depth += CountBraces(lines[i]);
-            }
-        }
-
-        return string.Join(Environment.NewLine, output);
-    }
-
-    private static int CountBraces(string line)
-    {
-        var count = 0;
-        var inString = false;
-
-        for (var i = 0; i < line.Length; i++)
-        {
-            if (line[i] == '"' && (i == 0 || line[i - 1] != '\\'))
-                inString = !inString;
-            else if (!inString)
-            {
-                if (line[i] == '{') count++;
-                else if (line[i] == '}') count--;
-            }
-        }
-
-        return count;
-    }
-
-    /// <summary>
-    /// Writes the single build_map.py helper (and a short README) into the export
-    /// root. The script converts each exported map into one clean .glb with
-    /// embedded textures; it only needs regular Python - no Blender install.
-    /// </summary>
-    private static void WriteBuilderScript(string outputRoot)
-    {
-        File.WriteAllText(Path.Combine(outputRoot, "build_map.py"), BuildMapScript.Content);
-    }
-
-    private static void WriteReadme(string outputRoot)
-    {
-        var readme = """
-            HOW TO GET THIS MAP INTO BLENDER
-            ================================
-
-            1. Install Python 3.8+ from python.org (or use the one you have).
-
-            2. Open a terminal in THIS folder and run:
-
-                   python build_map.py
-
-               That converts every map below Maps/ into a single .glb file with
-               all textures embedded. To build just one map:
-
-                   python build_map.py "Maps/<map name>"
-
-            3. In Blender:  File -> Import -> glTF 2.0  and pick
-               Maps/<map name>/<map name>.glb
-
-            Optional (better materials, smaller textures):
-                pip install pillow
-                python build_map.py --max-texture-size 2048
-
-            Folder layout
-            -------------
-              Maps/<Map Name>/source/          raw USD export (keep, it is the master copy)
-              Maps/<Map Name>/<Map Name>.glb   the model you import into Blender
-              Maps/<Map Name>/build-report.json what was built / skipped / missing
-              build_map.py                     the converter (safe to copy elsewhere)
-            """;
-        File.WriteAllText(Path.Combine(outputRoot, "README.txt"), readme);
-    }
-}
