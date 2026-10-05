@@ -174,6 +174,7 @@ public sealed class ArchiveService
                 foreach (var level in args.StreamingLevels)
                 {
                     filterCt.ThrowIfCancellationRequested();
+                    queuedWorldObjectPaths.Add(level.World.GetPathName());
                     session.Add(level.World);
                 }
             })
@@ -185,7 +186,10 @@ public sealed class ArchiveService
             // packages (_Art, _Unmerged, _Vege, etc.). Export the whole group into
             // one ExportSession instead of choosing only one "primary" world.
             foreach (var (_, world) in loadedWorlds)
+            {
+                queuedWorldObjectPaths.Add(world.GetPathName());
                 session.Add(world);
+            }
 
             var options = BuildExportOptions(exportTextures, exportMaterials);
 
@@ -195,7 +199,11 @@ public sealed class ArchiveService
             if (noGameLighting)
                 StripUsdLights(sourceOut);
 
-            var sourceWorlds = Directory.EnumerateFiles(sourceOut, "*.usda", SearchOption.TopDirectoryOnly)
+            var sourceWorlds = results
+                .Where(r => r.Success && queuedWorldObjectPaths.Contains(r.ObjectPath) && r.DiskFilePaths is not null)
+                .SelectMany(r => r.DiskFilePaths!)
+                .Where(p => p.EndsWith(".usda", StringComparison.OrdinalIgnoreCase))
+                .Distinct(StringComparer.OrdinalIgnoreCase)
                 .OrderBy(p => p, StringComparer.OrdinalIgnoreCase)
                 .Select(p => Path.GetRelativePath(mapOut, p).Replace('\\', '/'))
                 .ToList();
@@ -203,6 +211,19 @@ public sealed class ArchiveService
             // Blender's USD importer does not resolve USD sublayers/references
             // reliably. Create one composition root; build_map.py will flatten it
             // with Blender's bundled Pixar USD library before importing the geometry.
+            if (sourceWorlds.Count == 0)
+            {
+                summary.Add(new
+                {
+                    worlds = request.Worlds.Select(x => x.Path).ToArray(),
+                    displayName = request.DisplayName,
+                    success = false,
+                    resultCount = results.Count,
+                    error = "No exported UWorld USDA files were produced."
+                });
+                continue;
+            }
+
             var compositionRoot = WriteCompositionRoot(mapOut, request.DisplayName, sourceWorlds);
 
             // Generate the helper that actually imports the complete composed map.
