@@ -283,7 +283,7 @@ public sealed class ArchiveService
                 {
                     var path = splineObject.GetPathName();
                     assets.TryAdd(path, splineObject);
-                    scene.Assets.TryAdd(new SceneAsset(path, "SplineMesh"));
+                    AddSceneAsset(scene, path, "SplineMesh");
                     scene.Instances.Add(new SceneInstance
                     {
                         AssetKind = "SplineMesh",
@@ -297,7 +297,7 @@ public sealed class ArchiveService
             {
                 var path = meshObject.GetPathName();
                 assets.TryAdd(path, meshObject);
-                scene.Assets.TryAdd(new SceneAsset(path, "Mesh"));
+                AddSceneAsset(scene, path, "Mesh");
                 AddPlacement(mesh, meshObject, componentWorld, scene);
             }
         }
@@ -308,7 +308,7 @@ public sealed class ArchiveService
             {
                 var path = landscapeObject.GetPathName();
                 assets.TryAdd(path, landscapeObject);
-                scene.Assets.TryAdd(new SceneAsset(path, "Landscape"));
+                AddSceneAsset(scene, path, "Landscape");
                 scene.Instances.Add(new SceneInstance
                 {
                     AssetKind = "Landscape",
@@ -336,6 +336,12 @@ public sealed class ArchiveService
 
         foreach (var attached in component.AttachedActors)
             CollectActor(attached, componentWorld, scene, assets, ct);
+    }
+
+    private static void AddSceneAsset(MapSceneData scene, string objectPath, string kind)
+    {
+        if (!scene.Assets.Any(x => string.Equals(x.ObjectPath, objectPath, StringComparison.OrdinalIgnoreCase)))
+            scene.Assets.Add(new SceneAsset(objectPath, kind));
     }
 
     private static void AddPlacement(
